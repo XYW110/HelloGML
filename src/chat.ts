@@ -1,8 +1,25 @@
 import {
-  uuid, md5, unixTimestamp, timestamp, isBASE64Data, extractBASE64DataFormat,
-  removeBASE64DataHeader, getMimeType, getExtension, basename, isURL,
-  isArray, isObject, isString, isFiniteNumber, isUndefined, isError, attempt,
-  randomChoice, sleep, fetchFileBASE64
+  uuid,
+  md5,
+  unixTimestamp,
+  timestamp,
+  isBASE64Data,
+  extractBASE64DataFormat,
+  removeBASE64DataHeader,
+  getMimeType,
+  getExtension,
+  basename,
+  isURL,
+  isArray,
+  isObject,
+  isString,
+  isFiniteNumber,
+  isUndefined,
+  isError,
+  attempt,
+  randomChoice,
+  sleep,
+  fetchFileBASE64,
 } from "./utils.ts";
 import { createParser } from "./sse.ts";
 
@@ -14,9 +31,64 @@ const RETRY_DELAY = 5000;
 const FILE_MAX_SIZE = 100 * 1024 * 1024;
 
 let signSecret = "8a1317a7468aa3ad86e997d08f3f31cb";
-
 export function setSignSecret(secret: string) {
   signSecret = secret;
+}
+
+/**
+ * 从 token 池中选择下一个未尝试过的 token。
+ * - 若 pool 为空或未提供，回退到当前 currentToken
+ * - 若 pool 中所有 token 都已尝试过，回退到当前 currentToken（避免死循环）
+ * - 否则返回第一个未在 tried 列表中的 token
+ */
+function pickNextToken(
+  currentToken: string,
+  pool: string[] | undefined,
+  tried: string[]
+): string {
+  if (!pool || pool.length === 0) return currentToken;
+  const triedSet = new Set(tried);
+  const candidate = pool.find((t) => t && !triedSet.has(t));
+  return candidate || currentToken;
+}
+
+/**
+ * 脱敏打印 token，仅保留前 6 + 后 4 位，便于日志排查
+ */
+function maskToken(token: string): string {
+  if (!token) return "<empty>";
+  if (token.length <= 12) return `${token.slice(0, 2)}***`;
+  return `${token.slice(0, 6)}***${token.slice(-4)}`;
+}
+
+/**
+ * Chat 上报回调集合（由 index.ts 注入，chat.ts 不直接接触 KV）
+ * - onSuccess: token 调用成功（拿到合法 SSE 响应）→ 上层清零失败计数
+ * - onFailure: token 调用失败 → 上层根据 reason 累计失败计数 / 触发拉黑
+ */
+export interface ChatReporters {
+  onSuccess?: (token: string) => Promise<void> | void;
+  onFailure?: (
+    token: string,
+    info: {
+      status?: number;
+      bodyText?: string;
+      contentType?: string;
+      error?: { name?: string; message?: string };
+    }
+  ) => Promise<void> | void;
+}
+
+/**
+ * 安全调用 reporter —— 任何回调抛错都吞掉，不影响主流程
+ */
+async function safeReport(fn: (() => Promise<void> | void) | undefined) {
+  if (!fn) return;
+  try {
+    await fn();
+  } catch (e: any) {
+    console.error(`[chat reporter] error: ${e?.message}`);
+  }
 }
 
 const USER_AGENTS = [
@@ -24,20 +96,21 @@ const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0"
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
 ];
 
 const FAKE_HEADERS: Record<string, string> = {
-  "Accept": "text/event-stream",
+  Accept: "text/event-stream",
   "Accept-Encoding": "gzip, deflate, br, zstd",
   "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
   "App-Name": "chatglm",
   "Cache-Control": "no-cache",
   "Content-Type": "application/json",
-  "Origin": "https://chatglm.cn",
-  "Pragma": "no-cache",
-  "Priority": "u=1, i",
-  "Sec-Ch-Ua": '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+  Origin: "https://chatglm.cn",
+  Pragma: "no-cache",
+  Priority: "u=1, i",
+  "Sec-Ch-Ua":
+    '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
   "Sec-Ch-Ua-Mobile": "?0",
   "Sec-Ch-Ua-Platform": '"Windows"',
   "Sec-Fetch-Dest": "empty",
@@ -48,8 +121,9 @@ const FAKE_HEADERS: Record<string, string> = {
   "X-App-Version": "0.0.1",
   "X-Device-Brand": "",
   "X-Device-Model": "",
-  "X-Exp-Groups": "na_android_config:exp:NA,na_4o_config:exp:4o_A,tts_config:exp:tts_config_a,na_glm4plus_config:exp:open,mainchat_server_app:exp:A,mobile_history_daycheck:exp:a,desktop_toolbar:exp:A,chat_drawing_server:exp:A,drawing_server_cogview:exp:cogview4,app_welcome_v2:exp:A,chat_drawing_streamv2:exp:A,mainchat_rm_fc:exp:add,mainchat_dr:exp:open,chat_auto_entrance:exp:A,drawing_server_hi_dream:control:A,homepage_square:exp:close,assistant_recommend_prompt:exp:3,app_home_regular_user:exp:A,memory_common:exp:enable,mainchat_moe:exp:300,assistant_greet_user:exp:greet_user,app_welcome_personalize:exp:A,assistant_model_exp_group:exp:glm4.5,ai_wallet:exp:ai_wallet_enable",
-  "X-Lang": "zh"
+  "X-Exp-Groups":
+    "na_android_config:exp:NA,na_4o_config:exp:4o_A,tts_config:exp:tts_config_a,na_glm4plus_config:exp:open,mainchat_server_app:exp:A,mobile_history_daycheck:exp:a,desktop_toolbar:exp:A,chat_drawing_server:exp:A,drawing_server_cogview:exp:cogview4,app_welcome_v2:exp:A,chat_drawing_streamv2:exp:A,mainchat_rm_fc:exp:add,mainchat_dr:exp:open,chat_auto_entrance:exp:A,drawing_server_hi_dream:control:A,homepage_square:exp:close,assistant_recommend_prompt:exp:3,app_home_regular_user:exp:A,memory_common:exp:enable,mainchat_moe:exp:300,assistant_greet_user:exp:greet_user,app_welcome_personalize:exp:A,assistant_model_exp_group:exp:glm4.5,ai_wallet:exp:ai_wallet_enable",
+  "X-Lang": "zh",
 };
 
 function getHeaders() {
@@ -61,12 +135,14 @@ function getHeaders() {
 
 function injectToolsPrompt(messages: any[], tools: any[]): any[] {
   if (!tools || tools.length === 0) return messages;
-  const toolsDesc = tools.map((tool: any) => {
-    const fn = tool.function || tool;
-    return `### ${fn.name}
+  const toolsDesc = tools
+    .map((tool: any) => {
+      const fn = tool.function || tool;
+      return `### ${fn.name}
 Description: ${fn.description || ""}
 Parameters: ${JSON.stringify(fn.parameters || {}, null, 2)}`;
-  }).join("\n\n");
+    })
+    .join("\n\n");
   const prompt = `You are an assistant with access to tools. When you need to use a tool, you MUST output ONLY a single JSON object with NO markdown, NO explanations, and NO extra text.
 
 STRICT RULES:
@@ -90,14 +166,20 @@ Assistant: Hello! How can I help you today?`;
   const systemIdx = newMessages.findIndex((m: any) => m.role === "system");
   if (systemIdx >= 0) {
     const original = newMessages[systemIdx].content || "";
-    newMessages[systemIdx] = { ...newMessages[systemIdx], content: original + "\n\n" + prompt };
+    newMessages[systemIdx] = {
+      ...newMessages[systemIdx],
+      content: original + "\n\n" + prompt,
+    };
   } else {
     newMessages.unshift({ role: "system", content: prompt });
   }
   return newMessages;
 }
 
-function parseToolCalls(content: string): { tool_calls: any[] | null; text: string } {
+function parseToolCalls(content: string): {
+  tool_calls: any[] | null;
+  text: string;
+} {
   if (!content || !content.trim()) return { tool_calls: null, text: content };
   let working = content.trim();
 
@@ -112,22 +194,28 @@ function parseToolCalls(content: string): { tool_calls: any[] | null; text: stri
   if (braceMatch) {
     try {
       const parsed = JSON.parse(braceMatch);
-      if (parsed.tool_calls && Array.isArray(parsed.tool_calls) && parsed.tool_calls.length > 0) {
+      if (
+        parsed.tool_calls &&
+        Array.isArray(parsed.tool_calls) &&
+        parsed.tool_calls.length > 0
+      ) {
         const toolCalls = parsed.tool_calls.map((tc: any, idx: number) => ({
           id: `call_${Math.random().toString(36).slice(2, 11)}_${idx}`,
           type: "function",
           function: {
             name: tc.name || tc.function?.name || "",
-            arguments: typeof tc.arguments === "string"
-              ? tc.arguments
-              : typeof tc.function?.arguments === "string"
+            arguments:
+              typeof tc.arguments === "string"
+                ? tc.arguments
+                : typeof tc.function?.arguments === "string"
                 ? tc.function.arguments
                 : JSON.stringify(tc.arguments || tc.function?.arguments || {}),
           },
         }));
         // 移除原始内容中的 JSON 部分（包括代码块）
         let text = content.replace(braceMatch, "").trim();
-        if (codeBlockMatch) text = content.replace(codeBlockMatch[0], "").trim();
+        if (codeBlockMatch)
+          text = content.replace(codeBlockMatch[0], "").trim();
         return { tool_calls: toolCalls, text };
       }
     } catch (_) {
@@ -141,13 +229,20 @@ function parseToolCalls(content: string): { tool_calls: any[] | null; text: stri
       .replace(/(['"])?([a-zA-Z0-9_]+)(['"])?\s*:/g, '"$2":')
       .replace(/:\s*'([^']*)'/g, ':"$1"');
     const parsed = JSON.parse(fixed);
-    if (parsed.tool_calls && Array.isArray(parsed.tool_calls) && parsed.tool_calls.length > 0) {
+    if (
+      parsed.tool_calls &&
+      Array.isArray(parsed.tool_calls) &&
+      parsed.tool_calls.length > 0
+    ) {
       const toolCalls = parsed.tool_calls.map((tc: any, idx: number) => ({
         id: `call_${Math.random().toString(36).slice(2, 11)}_${idx}`,
         type: "function",
         function: {
           name: tc.name || tc.function?.name || "",
-          arguments: typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments || {}),
+          arguments:
+            typeof tc.arguments === "string"
+              ? tc.arguments
+              : JSON.stringify(tc.arguments || {}),
         },
       }));
       let text = content.replace(working, "").trim();
@@ -175,12 +270,24 @@ function extractJsonObject(str: string, key: string): string | null {
   let escape = false;
   for (let i = start; i < str.length; i++) {
     const ch = str[i];
-    if (escape) { escape = false; continue; }
-    if (ch === "\\") { escape = true; continue; }
-    if (ch === '"' && !escape) { inString = !inString; continue; }
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === '"' && !escape) {
+      inString = !inString;
+      continue;
+    }
     if (inString) continue;
     if (ch === "{") depth++;
-    else if (ch === "}") { depth--; if (depth === 0) return str.slice(start, i + 1); }
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return str.slice(start, i + 1);
+    }
   }
   return null;
 }
@@ -190,7 +297,9 @@ function convertToolMessages(messages: any[]): any[] {
     if (m.role === "tool") {
       return {
         role: "user",
-        content: `工具 ${m.name || ""} (调用ID: ${m.tool_call_id || ""}) 返回结果：\n${m.content || ""}`,
+        content: `工具 ${m.name || ""} (调用ID: ${
+          m.tool_call_id || ""
+        }) 返回结果：\n${m.content || ""}`,
       };
     }
     return m;
@@ -205,7 +314,9 @@ function getTokenCacheKey(refreshToken: string): Request {
   return new Request(`https://internal-cache/glm-token/${refreshToken}`);
 }
 
-async function getCachedAccessToken(refreshToken: string): Promise<string | null> {
+async function getCachedAccessToken(
+  refreshToken: string
+): Promise<string | null> {
   const response = await getWorkerCache().match(getTokenCacheKey(refreshToken));
   if (!response) return null;
   try {
@@ -215,10 +326,17 @@ async function getCachedAccessToken(refreshToken: string): Promise<string | null
   return null;
 }
 
-async function setCachedAccessToken(refreshToken: string, accessToken: string, refreshTime: number) {
-  await getWorkerCache().put(getTokenCacheKey(refreshToken), new Response(JSON.stringify({ accessToken, refreshTime }), {
-    headers: { "Content-Type": "application/json" }
-  }));
+async function setCachedAccessToken(
+  refreshToken: string,
+  accessToken: string,
+  refreshTime: number
+) {
+  await getWorkerCache().put(
+    getTokenCacheKey(refreshToken),
+    new Response(JSON.stringify({ accessToken, refreshTime }), {
+      headers: { "Content-Type": "application/json" },
+    })
+  );
 }
 
 async function deleteCachedAccessToken(refreshToken: string) {
@@ -242,7 +360,9 @@ const tokenRequestQueues: Record<string, Array<(result: any) => void>> = {};
 
 async function requestToken(refreshToken: string) {
   if (tokenRequestQueues[refreshToken]) {
-    return new Promise((resolve) => tokenRequestQueues[refreshToken].push(resolve));
+    return new Promise((resolve) =>
+      tokenRequestQueues[refreshToken].push(resolve)
+    );
   }
   tokenRequestQueues[refreshToken] = [];
   const doRequest = async () => {
@@ -250,23 +370,30 @@ async function requestToken(refreshToken: string) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 15000);
     try {
-      const response = await fetch("https://chatglm.cn/chatglm/user-api/user/refresh", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${refreshToken}`,
-          "Content-Type": "application/json",
-          ...getHeaders(),
-          "X-Device-Id": uuid(false),
-          "X-Nonce": sign.nonce,
-          "X-Request-Id": uuid(false),
-          "X-Sign": sign.sign,
-          "X-Timestamp": `${sign.timestamp}`,
-        },
-        signal: controller.signal,
-      });
+      const response = await fetch(
+        "https://chatglm.cn/chatglm/user-api/user/refresh",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${refreshToken}`,
+            "Content-Type": "application/json",
+            ...getHeaders(),
+            "X-Device-Id": uuid(false),
+            "X-Nonce": sign.nonce,
+            "X-Request-Id": uuid(false),
+            "X-Sign": sign.sign,
+            "X-Timestamp": `${sign.timestamp}`,
+          },
+          signal: controller.signal,
+        }
+      );
       const data = await checkResult(response, refreshToken);
       const { access_token, refresh_token } = data.result;
-      return { accessToken: access_token, refreshToken: refresh_token, refreshTime: unixTimestamp() + ACCESS_TOKEN_EXPIRES };
+      return {
+        accessToken: access_token,
+        refreshToken: refresh_token,
+        refreshTime: unixTimestamp() + ACCESS_TOKEN_EXPIRES,
+      };
     } finally {
       clearTimeout(timeoutId);
     }
@@ -287,50 +414,74 @@ async function acquireToken(refreshToken: string): Promise<string> {
   const cached = await getCachedAccessToken(refreshToken);
   if (cached) return cached;
   const tokenData: any = await requestToken(refreshToken);
-  await setCachedAccessToken(refreshToken, tokenData.accessToken, tokenData.refreshTime);
+  await setCachedAccessToken(
+    refreshToken,
+    tokenData.accessToken,
+    tokenData.refreshTime
+  );
   return tokenData.accessToken;
 }
 
-async function removeConversation(convId: string, refreshToken: string, assistantId = DEFAULT_ASSISTANT_ID) {
+async function removeConversation(
+  convId: string,
+  refreshToken: string,
+  assistantId = DEFAULT_ASSISTANT_ID
+) {
   const token = await acquireToken(refreshToken);
   const sign = await generateSign();
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 15000);
   try {
-    const response = await fetch("https://chatglm.cn/chatglm/backend-api/assistant/conversation/delete", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Referer: "https://chatglm.cn/main/alltoolsdetail",
-        "X-Device-Id": uuid(false),
-        "X-Request-Id": uuid(false),
-        "X-Sign": sign.sign,
-        "X-Timestamp": sign.timestamp,
-        "X-Nonce": sign.nonce,
-        ...getHeaders(),
-      },
-      body: JSON.stringify({ assistant_id: assistantId, conversation_id: convId }),
-      signal: controller.signal,
-    });
+    const response = await fetch(
+      "https://chatglm.cn/chatglm/backend-api/assistant/conversation/delete",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Referer: "https://chatglm.cn/main/alltoolsdetail",
+          "X-Device-Id": uuid(false),
+          "X-Request-Id": uuid(false),
+          "X-Sign": sign.sign,
+          "X-Timestamp": sign.timestamp,
+          "X-Nonce": sign.nonce,
+          ...getHeaders(),
+        },
+        body: JSON.stringify({
+          assistant_id: assistantId,
+          conversation_id: convId,
+        }),
+        signal: controller.signal,
+      }
+    );
     await checkResult(response, refreshToken);
-  } catch {}
-  finally { clearTimeout(timeoutId); }
+  } catch {
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
-async function checkResult(response: Response, refreshToken: string): Promise<any> {
+async function checkResult(
+  response: Response,
+  refreshToken: string
+): Promise<any> {
   const data: any = await response.json().catch(() => null);
   if (!data) return null;
   const { code, status, message } = data;
   if (!isFiniteNumber(code) && !isFiniteNumber(status)) return data;
   if (code === 0 || status === 0) return data;
   if (code == 401) await deleteCachedAccessToken(refreshToken);
-  if (message?.includes('40102')) {
+  if (message?.includes("40102")) {
     throw new Error(`[请求glm失败]: 您的refresh_token已过期，请重新登录获取`);
   }
   throw new Error(`[请求glm失败]: ${message}`);
 }
 
-async function glmPostStream(url: string, body: any, headers: Record<string, string>, timeout = 120000): Promise<Response> {
+async function glmPostStream(
+  url: string,
+  body: any,
+  headers: Record<string, string>,
+  timeout = 120000
+): Promise<Response> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
   try {
@@ -345,17 +496,37 @@ async function glmPostStream(url: string, body: any, headers: Record<string, str
   }
 }
 
-export async function createCompletion(messages: any[], refreshToken: string, model = MODEL_NAME, refConvId = "", retryCount = 0, tools?: any[]): Promise<any> {
+export async function createCompletion(
+  messages: any[],
+  refreshToken: string,
+  model = MODEL_NAME,
+  refConvId = "",
+  retryCount = 0,
+  tools?: any[],
+  tokenPool?: string[],
+  triedTokens?: string[],
+  reporters?: ChatReporters
+): Promise<any> {
   return (async () => {
     let processedMessages = convertToolMessages(messages);
     processedMessages = injectToolsPrompt(processedMessages, tools || []);
     const refFileUrls = extractRefFileUrls(processedMessages);
-    const refs = refFileUrls.length ? await Promise.all(refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))) : [];
+    const refs = refFileUrls.length
+      ? await Promise.all(
+          refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))
+        )
+      : [];
     if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
-    let assistantId = /^[a-z0-9]{24,}$/.test(model) ? model : DEFAULT_ASSISTANT_ID;
-    let chatMode = '';
-    if (model.includes('think') || model.includes('zero')) { chatMode = 'zero'; }
-    if (model.includes('deepresearch')) { chatMode = 'deep_research'; }
+    let assistantId = /^[a-z0-9]{24,}$/.test(model)
+      ? model
+      : DEFAULT_ASSISTANT_ID;
+    let chatMode = "";
+    if (model.includes("think") || model.includes("zero")) {
+      chatMode = "zero";
+    }
+    if (model.includes("deepresearch")) {
+      chatMode = "deep_research";
+    }
     const token = await acquireToken(refreshToken);
     const sign = await generateSign();
     const response = await glmPostStream(
@@ -376,7 +547,7 @@ export async function createCompletion(messages: any[], refreshToken: string, mo
           is_test: false,
           platform: "pc",
           quote_log_id: "",
-          cogview: { rm_label_watermark: false }
+          cogview: { rm_label_watermark: false },
         },
       },
       {
@@ -393,32 +564,91 @@ export async function createCompletion(messages: any[], refreshToken: string, mo
     if (!contentType.includes("text/event-stream")) {
       const errText = await response.text();
       console.error(errText);
-      throw new Error(`Stream response Content-Type invalid: ${contentType}`);
+      const e: any = new Error(
+        `Stream response Content-Type invalid: ${contentType}`
+      );
+      e.httpStatus = response.status;
+      e.bodyText = errText;
+      e.contentType = contentType;
+      throw e;
     }
     const answer = await receiveStream(model, response.body!, tools);
     removeConversation(answer.id, refreshToken, assistantId).catch(() => {});
+    // 上报成功：当前 refreshToken 工作正常
+    await safeReport(() => reporters?.onSuccess?.(refreshToken));
     return answer;
   })().catch(async (err) => {
+    // 上报失败（携带状态码 / body / contentType / error 对象）
+    await safeReport(() =>
+      reporters?.onFailure?.(refreshToken, {
+        status: err?.httpStatus,
+        bodyText: err?.bodyText,
+        contentType: err?.contentType,
+        error: { name: err?.name, message: err?.message },
+      })
+    );
     if (retryCount < MAX_RETRY_COUNT) {
       console.error(`Stream response error: ${err.stack || err.message}`);
       await sleep(RETRY_DELAY);
-      return createCompletion(messages, refreshToken, model, refConvId, retryCount + 1, tools);
+      // retry 时若提供了 token 池，则切换到下一个未尝试过的 token
+      const nextTried = [...(triedTokens || []), refreshToken];
+      const nextToken = pickNextToken(refreshToken, tokenPool, nextTried);
+      if (nextToken !== refreshToken) {
+        console.warn(
+          `[retry] switching refreshToken: ${maskToken(
+            refreshToken
+          )} -> ${maskToken(nextToken)} (tried=${nextTried.length}/${
+            tokenPool?.length || 0
+          })`
+        );
+      }
+      return createCompletion(
+        messages,
+        nextToken,
+        model,
+        refConvId,
+        retryCount + 1,
+        tools,
+        tokenPool,
+        nextTried,
+        reporters
+      );
     }
     throw err;
   });
 }
 
-export async function createCompletionStream(messages: any[], refreshToken: string, model = MODEL_NAME, refConvId = "", retryCount = 0, tools?: any[]): Promise<ReadableStream> {
+export async function createCompletionStream(
+  messages: any[],
+  refreshToken: string,
+  model = MODEL_NAME,
+  refConvId = "",
+  retryCount = 0,
+  tools?: any[],
+  tokenPool?: string[],
+  triedTokens?: string[],
+  reporters?: ChatReporters
+): Promise<ReadableStream> {
   return (async () => {
     let processedMessages = convertToolMessages(messages);
     processedMessages = injectToolsPrompt(processedMessages, tools || []);
     const refFileUrls = extractRefFileUrls(processedMessages);
-    const refs = refFileUrls.length ? await Promise.all(refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))) : [];
+    const refs = refFileUrls.length
+      ? await Promise.all(
+          refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))
+        )
+      : [];
     if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
-    let assistantId = /^[a-z0-9]{24,}$/.test(model) ? model : DEFAULT_ASSISTANT_ID;
-    let chatMode = '';
-    if (model.includes('think') || model.includes('zero')) { chatMode = 'zero'; }
-    if (model.includes('deepresearch')) { chatMode = 'deep_research'; }
+    let assistantId = /^[a-z0-9]{24,}$/.test(model)
+      ? model
+      : DEFAULT_ASSISTANT_ID;
+    let chatMode = "";
+    if (model.includes("think") || model.includes("zero")) {
+      chatMode = "zero";
+    }
+    if (model.includes("deepresearch")) {
+      chatMode = "deep_research";
+    }
     const token = await acquireToken(refreshToken);
     const sign = await generateSign();
     const response = await glmPostStream(
@@ -439,12 +669,15 @@ export async function createCompletionStream(messages: any[], refreshToken: stri
           is_test: false,
           platform: "pc",
           quote_log_id: "",
-          cogview: { rm_label_watermark: false }
+          cogview: { rm_label_watermark: false },
         },
       },
       {
         Authorization: `Bearer ${token}`,
-        Referer: assistantId == DEFAULT_ASSISTANT_ID ? "https://chatglm.cn/main/alltoolsdetail" : `https://chatglm.cn/main/gdetail/${assistantId}`,
+        Referer:
+          assistantId == DEFAULT_ASSISTANT_ID
+            ? "https://chatglm.cn/main/alltoolsdetail"
+            : `https://chatglm.cn/main/gdetail/${assistantId}`,
         "X-Device-Id": uuid(false),
         "X-Request-Id": uuid(false),
         "X-Sign": sign.sign,
@@ -455,37 +688,114 @@ export async function createCompletionStream(messages: any[], refreshToken: stri
     );
     const contentType = response.headers.get("content-type") || "";
     if (!contentType.includes("text/event-stream")) {
-      const errText = await response.text();
+      const errText = await response.text().catch(() => "");
       console.error("Invalid response Content-Type:", contentType, errText);
-      const encoder = new TextEncoder();
-      return new ReadableStream({
-        start(controller) {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-            id: "", model: MODEL_NAME, object: "chat.completion.chunk",
-            choices: [{ index: 0, delta: { role: "assistant", content: "服务暂时不可用，第三方响应错误" }, finish_reason: "stop" }],
-            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-            created: unixTimestamp(),
-          })}\n\n`));
-          controller.close();
-        }
-      });
+      // 抛出错误，交给外层 retry/上游 catch 处理，避免把错误内容伪装成正常 assistant chunk
+      const snippet = errText ? `: ${errText.slice(0, 300)}` : "";
+      const e: any = new Error(
+        `[请求glm失败][upstream non-SSE response, status=${response.status}, content-type=${contentType}]${snippet}`
+      );
+      e.httpStatus = response.status;
+      e.bodyText = errText;
+      e.contentType = contentType;
+      throw e;
     }
-    return createTransStream(model, response.body!, (convId: string) => {
-      removeConversation(convId, refreshToken, assistantId).catch(() => {});
-    }, tools);
+    // 拿到合法 SSE 头视为本次 token 可用 → 上报成功
+    await safeReport(() => reporters?.onSuccess?.(refreshToken));
+    return createTransStream(
+      model,
+      response.body!,
+      (convId: string) => {
+        removeConversation(convId, refreshToken, assistantId).catch(() => {});
+      },
+      tools
+    );
   })().catch(async (err) => {
+    // 上报失败
+    await safeReport(() =>
+      reporters?.onFailure?.(refreshToken, {
+        status: err?.httpStatus,
+        bodyText: err?.bodyText,
+        contentType: err?.contentType,
+        error: { name: err?.name, message: err?.message },
+      })
+    );
     if (retryCount < MAX_RETRY_COUNT) {
       console.error(`Stream response error: ${err.stack || err.message}`);
       await sleep(RETRY_DELAY);
-      return createCompletionStream(messages, refreshToken, model, refConvId, retryCount + 1, tools);
+      // retry 时若提供了 token 池，则切换到下一个未尝试过的 token
+      const nextTried = [...(triedTokens || []), refreshToken];
+      const nextToken = pickNextToken(refreshToken, tokenPool, nextTried);
+      if (nextToken !== refreshToken) {
+        console.warn(
+          `[retry-stream] switching refreshToken: ${maskToken(
+            refreshToken
+          )} -> ${maskToken(nextToken)} (tried=${nextTried.length}/${
+            tokenPool?.length || 0
+          })`
+        );
+      }
+      return createCompletionStream(
+        messages,
+        nextToken,
+        model,
+        refConvId,
+        retryCount + 1,
+        tools,
+        tokenPool,
+        nextTried,
+        reporters
+      );
     }
-    throw err;
+    // 重试用尽后，返回一个标准 OpenAI SSE 错误事件流，而不是把错误伪装为正常 assistant 输出
+    console.error(
+      `Stream response failed after ${MAX_RETRY_COUNT} retries: ${
+        err.stack || err.message
+      }`
+    );
+    const encoder = new TextEncoder();
+    const errorPayload = {
+      error: {
+        message: err?.message || "服务暂时不可用，第三方响应错误",
+        type: "upstream_error",
+        code: "upstream_unavailable",
+      },
+    };
+    const finalChunk = {
+      id: "",
+      model: MODEL_NAME,
+      object: "chat.completion.chunk",
+      choices: [{ index: 0, delta: {}, finish_reason: "error" }],
+      created: unixTimestamp(),
+    };
+    return new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify(errorPayload)}\n\n`)
+        );
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`)
+        );
+        controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
+        controller.close();
+      },
+    });
   });
 }
 
-export async function generateImages(model = "65a232c082ff90a2ad2f15e2", prompt: string, refreshToken: string, retryCount = 0): Promise<string[]> {
+export async function generateImages(
+  model = "65a232c082ff90a2ad2f15e2",
+  prompt: string,
+  refreshToken: string,
+  retryCount = 0
+): Promise<string[]> {
   return (async () => {
-    const messages = [{ role: "user", content: prompt.indexOf("画") == -1 ? `请画：${prompt}` : prompt }];
+    const messages = [
+      {
+        role: "user",
+        content: prompt.indexOf("画") == -1 ? `请画：${prompt}` : prompt,
+      },
+    ];
     const token = await acquireToken(refreshToken);
     const sign = await generateSign();
     const response = await glmPostStream(
@@ -495,8 +805,13 @@ export async function generateImages(model = "65a232c082ff90a2ad2f15e2", prompt:
         conversation_id: "",
         messages: messagesPrepare(messages, []),
         meta_data: {
-          channel: "", draft_id: "", if_plus_model: true,
-          input_question_type: "xxxx", is_test: false, platform: "pc", quote_log_id: ""
+          channel: "",
+          draft_id: "",
+          if_plus_model: true,
+          input_question_type: "xxxx",
+          is_test: false,
+          platform: "pc",
+          quote_log_id: "",
         },
       },
       {
@@ -511,7 +826,8 @@ export async function generateImages(model = "65a232c082ff90a2ad2f15e2", prompt:
       }
     );
     const contentType = response.headers.get("content-type") || "";
-    if (!contentType.includes("text/event-stream")) throw new Error(`Stream response Content-Type invalid: ${contentType}`);
+    if (!contentType.includes("text/event-stream"))
+      throw new Error(`Stream response Content-Type invalid: ${contentType}`);
     const { convId, imageUrls } = await receiveImages(response.body!);
     removeConversation(convId, refreshToken, model).catch(() => {});
     if (imageUrls.length == 0) throw new Error("图像生成失败");
@@ -526,18 +842,37 @@ export async function generateImages(model = "65a232c082ff90a2ad2f15e2", prompt:
   });
 }
 
-export async function generateVideos(model = "cogvideox", prompt: string, refreshToken: string, options: {
-  imageUrl: string; videoStyle: string; emotionalAtmosphere: string; mirrorMode: string; audioId: string;
-}, refConvId = "", retryCount = 0): Promise<any[]> {
+export async function generateVideos(
+  model = "cogvideox",
+  prompt: string,
+  refreshToken: string,
+  options: {
+    imageUrl: string;
+    videoStyle: string;
+    emotionalAtmosphere: string;
+    mirrorMode: string;
+    audioId: string;
+  },
+  refConvId = "",
+  retryCount = 0
+): Promise<any[]> {
   return (async () => {
     if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
     const sourceList: string[] = [];
     if (model == "cogvideox-pro") {
-      const imageUrls = await generateImages(undefined as any, prompt, refreshToken);
+      const imageUrls = await generateImages(
+        undefined as any,
+        prompt,
+        refreshToken
+      );
       options.imageUrl = imageUrls[0];
     }
     if (options.imageUrl) {
-      const uploadResult = await uploadFile(options.imageUrl, refreshToken, true);
+      const uploadResult = await uploadFile(
+        options.imageUrl,
+        refreshToken,
+        true
+      );
       sourceList.push(uploadResult.source_id);
     }
     let token = await acquireToken(refreshToken);
@@ -572,34 +907,43 @@ export async function generateVideos(model = "cogvideox", prompt: string, refres
         signal: controller.signal,
       });
       result = await checkResult(resp, refreshToken);
-    } finally { clearTimeout(timeoutId); }
+    } finally {
+      clearTimeout(timeoutId);
+    }
     const { chat_id: chatId, conversation_id: convId } = result.result;
     const startTime = unixTimestamp();
     const results: any[] = [];
     while (true) {
-      if (unixTimestamp() - startTime > 600) throw new Error("视频生成失败：超时");
+      if (unixTimestamp() - startTime > 600)
+        throw new Error("视频生成失败：超时");
       token = await acquireToken(refreshToken);
       const s = await generateSign();
       const ctrl = new AbortController();
       const tid = setTimeout(() => ctrl.abort(), 30000);
       let statusResult;
       try {
-        const resp = await fetch(`https://chatglm.cn/chatglm/video-api/v1/chat/status/${chatId}`, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            Referer: "https://chatglm.cn/video",
-            "X-Device-Id": uuid(false),
-            "X-Request-Id": uuid(false),
-            "X-Sign": s.sign,
-            "X-Timestamp": s.timestamp,
-            "X-Nonce": s.nonce,
-            ...getHeaders(),
-          },
-          signal: ctrl.signal,
-        });
+        const resp = await fetch(
+          `https://chatglm.cn/chatglm/video-api/v1/chat/status/${chatId}`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              Referer: "https://chatglm.cn/video",
+              "X-Device-Id": uuid(false),
+              "X-Request-Id": uuid(false),
+              "X-Sign": s.sign,
+              "X-Timestamp": s.timestamp,
+              "X-Nonce": s.nonce,
+              ...getHeaders(),
+            },
+            signal: ctrl.signal,
+          }
+        );
         statusResult = await checkResult(resp, refreshToken);
-      } finally { clearTimeout(tid); }
-      const { status, video_url, cover_url, video_duration, resolution } = statusResult.result;
+      } finally {
+        clearTimeout(tid);
+      }
+      const { status, video_url, cover_url, video_duration, resolution } =
+        statusResult.result;
       if (status != "init" && status != "processing") {
         if (status != "finished") throw new Error("视频生成失败");
         let videoUrl = video_url;
@@ -610,41 +954,65 @@ export async function generateVideos(model = "cogvideox", prompt: string, refres
           const ctrl2 = new AbortController();
           const tid2 = setTimeout(() => ctrl2.abort(), 30000);
           try {
-            const resp = await fetch("https://chatglm.cn/chatglm/video-api/v1/static/composite_video", {
-              method: "POST",
-              headers: {
-                Authorization: `Bearer ${token}`,
-                Referer: "https://chatglm.cn/video",
-                "X-Device-Id": uuid(false),
-                "X-Request-Id": uuid(false),
-                "X-Sign": s2.sign,
-                "X-Timestamp": s2.timestamp,
-                "X-Nonce": s2.nonce,
-                ...getHeaders(),
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({ chat_id: chatId, key, audio_id: id }),
-              signal: ctrl2.signal,
-            });
+            const resp = await fetch(
+              "https://chatglm.cn/chatglm/video-api/v1/static/composite_video",
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  Referer: "https://chatglm.cn/video",
+                  "X-Device-Id": uuid(false),
+                  "X-Request-Id": uuid(false),
+                  "X-Sign": s2.sign,
+                  "X-Timestamp": s2.timestamp,
+                  "X-Nonce": s2.nonce,
+                  ...getHeaders(),
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ chat_id: chatId, key, audio_id: id }),
+                signal: ctrl2.signal,
+              }
+            );
             const compositeResult = await checkResult(resp, refreshToken);
             videoUrl = compositeResult.result.url;
-          } finally { clearTimeout(tid2); }
+          } finally {
+            clearTimeout(tid2);
+          }
         }
-        results.push({ conversation_id: convId, cover_url, video_url: videoUrl, video_duration, resolution });
+        results.push({
+          conversation_id: convId,
+          cover_url,
+          video_url: videoUrl,
+          video_duration,
+          resolution,
+        });
         break;
       }
       await sleep(1000);
     }
     fetch(`https://chatglm.cn/chatglm/video-api/v1/chat/${chatId}`, {
       method: "DELETE",
-      headers: { Authorization: `Bearer ${token}`, Referer: "https://chatglm.cn/video", "X-Device-Id": uuid(false), "X-Request-Id": uuid(false), ...getHeaders() },
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Referer: "https://chatglm.cn/video",
+        "X-Device-Id": uuid(false),
+        "X-Request-Id": uuid(false),
+        ...getHeaders(),
+      },
     }).catch(() => {});
     return results;
   })().catch(async (err) => {
     if (retryCount < MAX_RETRY_COUNT) {
       console.error(`Video generation error: ${err.message}`);
       await sleep(RETRY_DELAY);
-      return generateVideos(model, prompt, refreshToken, options, refConvId, retryCount + 1);
+      return generateVideos(
+        model,
+        prompt,
+        refreshToken,
+        options,
+        refConvId,
+        retryCount + 1
+      );
     }
     throw err;
   });
@@ -657,8 +1025,18 @@ function extractRefFileUrls(messages: any[]) {
   if (isArray(lastMessage.content)) {
     lastMessage.content.forEach((v: any) => {
       if (!isObject(v) || !["file", "image_url"].includes(v["type"])) return;
-      if (v["type"] == "file" && isObject(v["file_url"]) && isString(v["file_url"]["url"])) urls.push(v["file_url"]["url"]);
-      else if (v["type"] == "image_url" && isObject(v["image_url"]) && isString(v["image_url"]["url"])) urls.push(v["image_url"]["url"]);
+      if (
+        v["type"] == "file" &&
+        isObject(v["file_url"]) &&
+        isString(v["file_url"]["url"])
+      )
+        urls.push(v["file_url"]["url"]);
+      else if (
+        v["type"] == "image_url" &&
+        isObject(v["image_url"]) &&
+        isString(v["image_url"]["url"])
+      )
+        urls.push(v["image_url"]["url"]);
     });
   }
   return urls;
@@ -678,47 +1056,79 @@ function messagesPrepare(messages: any[], refs: any[], isRefConv = false) {
     }, "");
   } else {
     const latestMessage = messages[messages.length - 1];
-    const hasFileOrImage = isArray(latestMessage.content) && latestMessage.content.some((v: any) => typeof v === "object" && ["file", "image_url"].includes(v["type"]));
+    const hasFileOrImage =
+      isArray(latestMessage.content) &&
+      latestMessage.content.some(
+        (v: any) =>
+          typeof v === "object" && ["file", "image_url"].includes(v["type"])
+      );
     if (hasFileOrImage) {
-      messages.splice(messages.length - 1, 0, { content: "关注用户最新发送文件和消息", role: "system" });
+      messages.splice(messages.length - 1, 0, {
+        content: "关注用户最新发送文件和消息",
+        role: "system",
+      });
     }
-    content = (messages.reduce((content: string, message: any) => {
-      const role = message.role.replace("system", "<|sytstem|>").replace("assistant", "<|assistant|>").replace("user", "<|user|>");
-      if (isArray(message.content)) {
-        return message.content.reduce((_content: string, v: any) => {
-          if (!isObject(v) || v["type"] != "text") return _content;
-          return _content + (`${role}\n` + v["text"] || "") + "\n";
-        }, content);
-      }
-      return (content += `${role}\n${message.content}\n`);
-    }, "") + "<|assistant|>\n").replace(/\!\[.+\]\(.+\)/g, "").replace(/\/mnt\/data\/.+/g, "");
+    content = (
+      messages.reduce((content: string, message: any) => {
+        const role = message.role
+          .replace("system", "<|sytstem|>")
+          .replace("assistant", "<|assistant|>")
+          .replace("user", "<|user|>");
+        if (isArray(message.content)) {
+          return message.content.reduce((_content: string, v: any) => {
+            if (!isObject(v) || v["type"] != "text") return _content;
+            return _content + (`${role}\n` + v["text"] || "") + "\n";
+          }, content);
+        }
+        return (content += `${role}\n${message.content}\n`);
+      }, "") + "<|assistant|>\n"
+    )
+      .replace(/\!\[.+\]\(.+\)/g, "")
+      .replace(/\/mnt\/data\/.+/g, "");
   }
   const fileRefs = refs.filter((ref) => !ref.width && !ref.height);
-  const imageRefs = refs.filter((ref) => ref.width || ref.height).map((ref: any) => { ref.image_url = ref.file_url; return ref; });
-  return [{
-    role: "user",
-    content: [
-      { type: "text", text: content },
-      ...(fileRefs.length == 0 ? [] : [{ type: "file", file: fileRefs }]),
-      ...(imageRefs.length == 0 ? [] : [{ type: "image", image: imageRefs }]),
-    ],
-  }];
+  const imageRefs = refs
+    .filter((ref) => ref.width || ref.height)
+    .map((ref: any) => {
+      ref.image_url = ref.file_url;
+      return ref;
+    });
+  return [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: content },
+        ...(fileRefs.length == 0 ? [] : [{ type: "file", file: fileRefs }]),
+        ...(imageRefs.length == 0 ? [] : [{ type: "image", image: imageRefs }]),
+      ],
+    },
+  ];
 }
 
 async function checkFileUrl(fileUrl: string) {
   if (isBASE64Data(fileUrl)) return;
   const response = await fetch(fileUrl, { method: "HEAD" });
-  if (response.status >= 400) throw new Error(`File ${fileUrl} is not valid: [${response.status}] ${response.statusText}`);
+  if (response.status >= 400)
+    throw new Error(
+      `File ${fileUrl} is not valid: [${response.status}] ${response.statusText}`
+    );
   const contentLength = response.headers.get("content-length");
   if (contentLength) {
     const fileSize = parseInt(contentLength, 10);
-    if (fileSize > FILE_MAX_SIZE) throw new Error(`File ${fileUrl} exceeds size limit`);
+    if (fileSize > FILE_MAX_SIZE)
+      throw new Error(`File ${fileUrl} exceeds size limit`);
   }
 }
 
-async function uploadFile(fileUrl: string, refreshToken: string, isVideoImage = false) {
+async function uploadFile(
+  fileUrl: string,
+  refreshToken: string,
+  isVideoImage = false
+) {
   await checkFileUrl(fileUrl);
-  let filename: string, fileData: ArrayBuffer, mimeType: string | null = null;
+  let filename: string,
+    fileData: ArrayBuffer,
+    mimeType: string | null = null;
   if (isBASE64Data(fileUrl)) {
     mimeType = extractBASE64DataFormat(fileUrl);
     const ext = mimeType ? getExtension(mimeType) : "bin";
@@ -742,7 +1152,9 @@ async function uploadFile(fileUrl: string, refreshToken: string, isVideoImage = 
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
-      Referer: isVideoImage ? "https://chatglm.cn/video" : "https://chatglm.cn/",
+      Referer: isVideoImage
+        ? "https://chatglm.cn/video"
+        : "https://chatglm.cn/",
       ...getHeaders(),
     },
     body: formData,
@@ -751,30 +1163,58 @@ async function uploadFile(fileUrl: string, refreshToken: string, isVideoImage = 
   return uploadResult.result;
 }
 
-async function receiveStream(model: string, readableStream: ReadableStream, tools?: any[]): Promise<any> {
+async function receiveStream(
+  model: string,
+  readableStream: ReadableStream,
+  tools?: any[]
+): Promise<any> {
   return new Promise((resolve, reject) => {
     const data = {
-      id: "", model, object: "chat.completion",
-      choices: [{ index: 0, message: { role: "assistant", content: "", reasoning_content: null as string | null }, finish_reason: "stop" }],
+      id: "",
+      model,
+      object: "chat.completion",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "",
+            reasoning_content: null as string | null,
+          },
+          finish_reason: "stop",
+        },
+      ],
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
       created: unixTimestamp(),
     };
-    const isSilentModel = model.includes('silent');
+    const isSilentModel = model.includes("silent");
     const cachedParts: any[] = [];
     const parser = createParser((event) => {
       try {
         const result = attempt(() => JSON.parse(event.data));
-        if (isError(result)) throw new Error(`Stream response invalid: ${event.data}`);
-        if (!data.id && result.conversation_id) data.id = result.conversation_id;
+        if (isError(result))
+          throw new Error(`Stream response invalid: ${event.data}`);
+        if (!data.id && result.conversation_id)
+          data.id = result.conversation_id;
         if (result.status != "finish") {
-          if (result.parts) { cachedParts.length = 0; cachedParts.push(...result.parts); }
+          if (result.parts) {
+            cachedParts.length = 0;
+            cachedParts.push(...result.parts);
+          }
           const searchMap = new Map<string, any>();
           cachedParts.forEach((part) => {
             if (!part.content || !isArray(part.content)) return;
             const { meta_data } = part;
             part.content.forEach((item: any) => {
-              if (item.type == "tool_result" && meta_data?.tool_result_extra?.search_results) {
-                meta_data.tool_result_extra.search_results.forEach((res: any) => { if (res.match_key) searchMap.set(res.match_key, res); });
+              if (
+                item.type == "tool_result" &&
+                meta_data?.tool_result_extra?.search_results
+              ) {
+                meta_data.tool_result_extra.search_results.forEach(
+                  (res: any) => {
+                    if (res.match_key) searchMap.set(res.match_key, res);
+                  }
+                );
               }
             });
           });
@@ -788,38 +1228,91 @@ async function receiveStream(model: string, readableStream: ReadableStream, tool
             let partText = "";
             let partReasoning = "";
             content.forEach((value: any) => {
-              const { type, text, think, image, code, content: innerContent } = value;
+              const {
+                type,
+                text,
+                think,
+                image,
+                code,
+                content: innerContent,
+              } = value;
               if (type == "text") {
                 let txt = text;
                 if (searchMap.size > 0) {
-                  txt = txt.replace(/【?(turn\d+[a-zA-Z]+\d+)】?/g, (match: string, key: string) => {
-                    const searchInfo = searchMap.get(key);
-                    if (!searchInfo) return match;
-                    if (!keyToIdMap.has(key)) keyToIdMap.set(key, counter++);
-                    const newId = keyToIdMap.get(key);
-                    return ` [${newId}](${searchInfo.url})`;
-                  });
+                  txt = txt.replace(
+                    /【?(turn\d+[a-zA-Z]+\d+)】?/g,
+                    (match: string, key: string) => {
+                      const searchInfo = searchMap.get(key);
+                      if (!searchInfo) return match;
+                      if (!keyToIdMap.has(key)) keyToIdMap.set(key, counter++);
+                      const newId = keyToIdMap.get(key);
+                      return ` [${newId}](${searchInfo.url})`;
+                    }
+                  );
                 }
                 partText += txt;
               } else if (type == "think" && !isSilentModel) {
                 partReasoning += think;
-              } else if (type == "tool_result" && meta_data?.tool_result_extra?.search_results && isArray(meta_data.tool_result_extra.search_results) && !isSilentModel) {
-                partReasoning += meta_data.tool_result_extra.search_results.reduce((meta: string, v: any) => meta + `> 检索 ${v.title}(${v.url}) ...\n`, "");
-              } else if (type == "quote_result" && part.status == "finish" && meta_data && isArray(meta_data.metadata_list) && !isSilentModel) {
-                partReasoning += meta_data.metadata_list.reduce((meta: string, v: any) => meta + `> 检索 ${v.title}(${v.url}) ...\n`, "");
-              } else if (type == "image" && isArray(image) && part.status == "finish") {
-                partText += image.reduce((imgs: string, v: any) => imgs + (/^(http|https):\/\//.test(v.image_url) ? `![图像](${v.image_url || ""})` : ""), "") + "\n";
+              } else if (
+                type == "tool_result" &&
+                meta_data?.tool_result_extra?.search_results &&
+                isArray(meta_data.tool_result_extra.search_results) &&
+                !isSilentModel
+              ) {
+                partReasoning +=
+                  meta_data.tool_result_extra.search_results.reduce(
+                    (meta: string, v: any) =>
+                      meta + `> 检索 ${v.title}(${v.url}) ...\n`,
+                    ""
+                  );
+              } else if (
+                type == "quote_result" &&
+                part.status == "finish" &&
+                meta_data &&
+                isArray(meta_data.metadata_list) &&
+                !isSilentModel
+              ) {
+                partReasoning += meta_data.metadata_list.reduce(
+                  (meta: string, v: any) =>
+                    meta + `> 检索 ${v.title}(${v.url}) ...\n`,
+                  ""
+                );
+              } else if (
+                type == "image" &&
+                isArray(image) &&
+                part.status == "finish"
+              ) {
+                partText +=
+                  image.reduce(
+                    (imgs: string, v: any) =>
+                      imgs +
+                      (/^(http|https):\/\//.test(v.image_url)
+                        ? `![图像](${v.image_url || ""})`
+                        : ""),
+                    ""
+                  ) + "\n";
               } else if (type == "code") {
-                partText += "\`\`\`python\n" + code + (part.status == "finish" ? "\n\`\`\`\n" : "");
-              } else if (type == "execution_output" && isString(innerContent) && part.status == "finish") {
+                partText +=
+                  "```python\n" +
+                  code +
+                  (part.status == "finish" ? "\n```\n" : "");
+              } else if (
+                type == "execution_output" &&
+                isString(innerContent) &&
+                part.status == "finish"
+              ) {
                 partText += innerContent + "\n";
               }
             });
-            if (partText) fullText += (fullText.length > 0 ? "\n" : "") + partText;
-            if (partReasoning) fullReasoning += (fullReasoning.length > 0 ? "\n" : "") + partReasoning;
+            if (partText)
+              fullText += (fullText.length > 0 ? "\n" : "") + partText;
+            if (partReasoning)
+              fullReasoning +=
+                (fullReasoning.length > 0 ? "\n" : "") + partReasoning;
           });
           data.choices[0].message.content = fullText;
-          (data.choices[0].message as any).reasoning_content = fullReasoning || null;
+          (data.choices[0].message as any).reasoning_content =
+            fullReasoning || null;
         } else {
           let content = data.choices[0].message.content;
           content = content.replace(/【\d+†(来源|源|source)】/g, "");
@@ -844,7 +1337,10 @@ async function receiveStream(model: string, readableStream: ReadableStream, tool
       try {
         while (true) {
           const { done, value } = await reader.read();
-          if (done) { resolve(data); break; }
+          if (done) {
+            resolve(data);
+            break;
+          }
           parser.feed(decoder.decode(value, { stream: true }));
         }
       } catch (err) {
@@ -856,10 +1352,15 @@ async function receiveStream(model: string, readableStream: ReadableStream, tool
   });
 }
 
-function createTransStream(model: string, readableStream: ReadableStream, endCallback?: (convId: string) => void, tools?: any[]): ReadableStream {
+function createTransStream(
+  model: string,
+  readableStream: ReadableStream,
+  endCallback?: (convId: string) => void,
+  tools?: any[]
+): ReadableStream {
   const created = unixTimestamp();
   const encoder = new TextEncoder();
-  const isSilentModel = model.includes('silent');
+  const isSilentModel = model.includes("silent");
   let sentContent = "";
   let sentReasoning = "";
   let fullContent = "";
@@ -869,11 +1370,23 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
   const cachedParts: any[] = [];
   return new ReadableStream({
     async start(controller) {
-      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-        id: "", model, object: "chat.completion.chunk",
-        choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
-        created,
-      })}\n\n`));
+      controller.enqueue(
+        encoder.encode(
+          `data: ${JSON.stringify({
+            id: "",
+            model,
+            object: "chat.completion.chunk",
+            choices: [
+              {
+                index: 0,
+                delta: { role: "assistant", content: "" },
+                finish_reason: null,
+              },
+            ],
+            created,
+          })}\n\n`
+        )
+      );
       const reader = readableStream.getReader();
       const decoder = new TextDecoder();
       const parser = createParser((event) => {
@@ -883,7 +1396,9 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
           if (result.status != "finish" && result.status != "intervene") {
             if (result.parts) {
               result.parts.forEach((part: any) => {
-                const index = cachedParts.findIndex((p) => p.logic_id === part.logic_id);
+                const index = cachedParts.findIndex(
+                  (p) => p.logic_id === part.logic_id
+                );
                 if (index !== -1) cachedParts[index] = part;
                 else cachedParts.push(part);
               });
@@ -893,8 +1408,15 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
               if (!part.content || !isArray(part.content)) return;
               const { meta_data } = part;
               part.content.forEach((item: any) => {
-                if (item.type == "tool_result" && meta_data?.tool_result_extra?.search_results) {
-                  meta_data.tool_result_extra.search_results.forEach((res: any) => { if (res.match_key) searchMap.set(res.match_key, res); });
+                if (
+                  item.type == "tool_result" &&
+                  meta_data?.tool_result_extra?.search_results
+                ) {
+                  meta_data.tool_result_extra.search_results.forEach(
+                    (res: any) => {
+                      if (res.match_key) searchMap.set(res.match_key, res);
+                    }
+                  );
                 }
               });
             });
@@ -908,44 +1430,111 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
               let partText = "";
               let partReasoning = "";
               content.forEach((value: any) => {
-                const { type, text, think, image, code, content: innerContent } = value;
+                const {
+                  type,
+                  text,
+                  think,
+                  image,
+                  code,
+                  content: innerContent,
+                } = value;
                 if (type == "text") {
                   let txt = text;
                   if (searchMap.size > 0) {
-                    txt = txt.replace(/【?(turn\d+[a-zA-Z]+\d+)】?/g, (match: string, key: string) => {
-                      const searchInfo = searchMap.get(key);
-                      if (!searchInfo) return match;
-                      if (!keyToIdMap.has(key)) keyToIdMap.set(key, counter++);
-                      const newId = keyToIdMap.get(key);
-                      return ` [${newId}](${searchInfo.url})`;
-                    });
+                    txt = txt.replace(
+                      /【?(turn\d+[a-zA-Z]+\d+)】?/g,
+                      (match: string, key: string) => {
+                        const searchInfo = searchMap.get(key);
+                        if (!searchInfo) return match;
+                        if (!keyToIdMap.has(key))
+                          keyToIdMap.set(key, counter++);
+                        const newId = keyToIdMap.get(key);
+                        return ` [${newId}](${searchInfo.url})`;
+                      }
+                    );
                   }
                   partText += txt;
                 } else if (type == "think" && !isSilentModel) {
                   partReasoning += think;
-                } else if (type == "tool_result" && meta_data?.tool_result_extra?.search_results && isArray(meta_data.tool_result_extra.search_results) && !isSilentModel) {
-                  partReasoning += meta_data.tool_result_extra.search_results.reduce((meta: string, v: any) => meta + `> 检索 ${v.title}(${v.url}) ...\n`, "");
-                } else if (type == "quote_result" && part.status == "finish" && meta_data && isArray(meta_data.metadata_list) && !isSilentModel) {
-                  partReasoning += meta_data.metadata_list.reduce((meta: string, v: any) => meta + `> 检索 ${v.title}(${v.url}) ...\n`, "");
-                } else if (type == "image" && isArray(image) && part.status == "finish") {
-                  partText += image.reduce((imgs: string, v: any) => imgs + (/^(http|https):\/\//.test(v.image_url) ? `![图像](${v.image_url || ""})` : ""), "") + "\n";
+                } else if (
+                  type == "tool_result" &&
+                  meta_data?.tool_result_extra?.search_results &&
+                  isArray(meta_data.tool_result_extra.search_results) &&
+                  !isSilentModel
+                ) {
+                  partReasoning +=
+                    meta_data.tool_result_extra.search_results.reduce(
+                      (meta: string, v: any) =>
+                        meta + `> 检索 ${v.title}(${v.url}) ...\n`,
+                      ""
+                    );
+                } else if (
+                  type == "quote_result" &&
+                  part.status == "finish" &&
+                  meta_data &&
+                  isArray(meta_data.metadata_list) &&
+                  !isSilentModel
+                ) {
+                  partReasoning += meta_data.metadata_list.reduce(
+                    (meta: string, v: any) =>
+                      meta + `> 检索 ${v.title}(${v.url}) ...\n`,
+                    ""
+                  );
+                } else if (
+                  type == "image" &&
+                  isArray(image) &&
+                  part.status == "finish"
+                ) {
+                  partText +=
+                    image.reduce(
+                      (imgs: string, v: any) =>
+                        imgs +
+                        (/^(http|https):\/\//.test(v.image_url)
+                          ? `![图像](${v.image_url || ""})`
+                          : ""),
+                      ""
+                    ) + "\n";
                 } else if (type == "code") {
-                  partText += "\`\`\`python\n" + code + (part.status == "finish" ? "\n\`\`\`\n" : "");
-                } else if (type == "execution_output" && isString(innerContent) && part.status == "finish") {
+                  partText +=
+                    "```python\n" +
+                    code +
+                    (part.status == "finish" ? "\n```\n" : "");
+                } else if (
+                  type == "execution_output" &&
+                  isString(innerContent) &&
+                  part.status == "finish"
+                ) {
                   partText += innerContent + "\n";
                 }
               });
-              if (partText) fullText += (fullText.length > 0 ? "\n" : "") + partText;
-              if (partReasoning) fullReasoning += (fullReasoning.length > 0 ? "\n" : "") + partReasoning;
+              if (partText)
+                fullText += (fullText.length > 0 ? "\n" : "") + partText;
+              if (partReasoning)
+                fullReasoning +=
+                  (fullReasoning.length > 0 ? "\n" : "") + partReasoning;
             });
-            const reasoningChunk = fullReasoning.substring(sentReasoning.length);
+            const reasoningChunk = fullReasoning.substring(
+              sentReasoning.length
+            );
             if (reasoningChunk) {
               sentReasoning += reasoningChunk;
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",
-                choices: [{ index: 0, delta: { reasoning_content: reasoningChunk }, finish_reason: null }],
-                created,
-              })}\n\n`));
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({
+                    id: result.conversation_id,
+                    model: MODEL_NAME,
+                    object: "chat.completion.chunk",
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { reasoning_content: reasoningChunk },
+                        finish_reason: null,
+                      },
+                    ],
+                    created,
+                  })}\n\n`
+                )
+              );
             }
             const chunk = fullText.substring(sentContent.length);
             if (chunk) {
@@ -961,43 +1550,86 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
                     pendingContent += chunk;
                   } else {
                     // 不以 { 开头，直接发送
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                      id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",
-                      choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }],
-                      created,
-                    })}\n\n`));
+                    controller.enqueue(
+                      encoder.encode(
+                        `data: ${JSON.stringify({
+                          id: result.conversation_id,
+                          model: MODEL_NAME,
+                          object: "chat.completion.chunk",
+                          choices: [
+                            {
+                              index: 0,
+                              delta: { content: chunk },
+                              finish_reason: null,
+                            },
+                          ],
+                          created,
+                        })}\n\n`
+                      )
+                    );
                   }
                 } else {
                   // 已在缓冲模式，继续累积
                   pendingContent += chunk;
                   // 当累积足够内容后，判断是否是工具调用
                   if (trimmed.length >= 20) {
-                    if (trimmed.includes('"tool_calls"') || trimmed.includes("'tool_calls'") || trimmed.includes("tool_calls")) {
+                    if (
+                      trimmed.includes('"tool_calls"') ||
+                      trimmed.includes("'tool_calls'") ||
+                      trimmed.includes("tool_calls")
+                    ) {
                       isToolCallMode = true;
                       pendingContent = "";
                     } else {
                       // 不是工具调用，一次性发送缓冲内容
                       mightBeToolCall = false;
-                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                        id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",
-                        choices: [{ index: 0, delta: { content: pendingContent }, finish_reason: null }],
-                        created,
-                      })}\n\n`));
+                      controller.enqueue(
+                        encoder.encode(
+                          `data: ${JSON.stringify({
+                            id: result.conversation_id,
+                            model: MODEL_NAME,
+                            object: "chat.completion.chunk",
+                            choices: [
+                              {
+                                index: 0,
+                                delta: { content: pendingContent },
+                                finish_reason: null,
+                              },
+                            ],
+                            created,
+                          })}\n\n`
+                        )
+                      );
                       pendingContent = "";
                     }
                   }
                 }
               } else if (!isToolCallMode) {
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                  id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",
-                  choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }],
-                  created,
-                })}\n\n`));
+                controller.enqueue(
+                  encoder.encode(
+                    `data: ${JSON.stringify({
+                      id: result.conversation_id,
+                      model: MODEL_NAME,
+                      object: "chat.completion.chunk",
+                      choices: [
+                        {
+                          index: 0,
+                          delta: { content: chunk },
+                          finish_reason: null,
+                        },
+                      ],
+                      created,
+                    })}\n\n`
+                  )
+                );
               }
             }
           } else {
             let finishReason = "stop";
-            let delta: any = result.status == "intervene" && result.last_error?.intervene_text ? { content: `\n\n${result.last_error.intervene_text}` } : {};
+            let delta: any =
+              result.status == "intervene" && result.last_error?.intervene_text
+                ? { content: `\n\n${result.last_error.intervene_text}` }
+                : {};
             if (tools && tools.length > 0) {
               const parsed = parseToolCalls(fullContent);
               if (parsed.tool_calls) {
@@ -1005,16 +1637,28 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
                 delta = { tool_calls: parsed.tool_calls };
               }
             }
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-              id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",
-              choices: [{
-                index: 0,
-                delta,
-                finish_reason: finishReason,
-              }],
-              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-              created,
-            })}\n\n`));
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({
+                  id: result.conversation_id,
+                  model: MODEL_NAME,
+                  object: "chat.completion.chunk",
+                  choices: [
+                    {
+                      index: 0,
+                      delta,
+                      finish_reason: finishReason,
+                    },
+                  ],
+                  usage: {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                  },
+                  created,
+                })}\n\n`
+              )
+            );
             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
             controller.close();
             endCallback?.(result.conversation_id);
@@ -1026,7 +1670,10 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
       try {
         while (true) {
           const { done, value } = await reader.read();
-          if (done) { controller.close(); break; }
+          if (done) {
+            controller.close();
+            break;
+          }
           parser.feed(decoder.decode(value, { stream: true }));
         }
       } catch (err) {
@@ -1034,20 +1681,24 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
       } finally {
         reader.releaseLock();
       }
-    }
+    },
   });
 }
 
-async function receiveImages(readableStream: ReadableStream): Promise<{ convId: string; imageUrls: string[] }> {
+async function receiveImages(
+  readableStream: ReadableStream
+): Promise<{ convId: string; imageUrls: string[] }> {
   return new Promise((resolve, reject) => {
     let convId = "";
     const imageUrls: string[] = [];
     const parser = createParser((event) => {
       try {
         const result = attempt(() => JSON.parse(event.data));
-        if (isError(result)) throw new Error(`Stream response invalid: ${event.data}`);
+        if (isError(result))
+          throw new Error(`Stream response invalid: ${event.data}`);
         if (!convId && result.conversation_id) convId = result.conversation_id;
-        if (result.status == "intervene") throw new Error("内容由于合规问题已被阻止生成");
+        if (result.status == "intervene")
+          throw new Error("内容由于合规问题已被阻止生成");
         if (result.status != "finish") {
           result.parts.forEach((part: any) => {
             const { status: partStatus, content } = part;
@@ -1056,7 +1707,11 @@ async function receiveImages(readableStream: ReadableStream): Promise<{ convId: 
               const { type, image, text } = value;
               if (type == "image" && isArray(image) && partStatus == "finish") {
                 image.forEach((value: any) => {
-                  if (!/^(http|https):\/\//.test(value.image_url) || imageUrls.includes(value.image_url)) return;
+                  if (
+                    !/^(http|https):\/\//.test(value.image_url) ||
+                    imageUrls.includes(value.image_url)
+                  )
+                    return;
                   imageUrls.push(value.image_url);
                 });
               }
@@ -1081,7 +1736,10 @@ async function receiveImages(readableStream: ReadableStream): Promise<{ convId: 
       try {
         while (true) {
           const { done, value } = await reader.read();
-          if (done) { resolve({ convId, imageUrls }); break; }
+          if (done) {
+            resolve({ convId, imageUrls });
+            break;
+          }
           parser.feed(decoder.decode(value, { stream: true }));
         }
       } catch (err) {
@@ -1100,20 +1758,23 @@ export function tokenSplit(authorization: string): string[] {
 export async function getTokenLiveStatus(refreshToken: string) {
   const sign = await generateSign();
   try {
-    const response = await fetch("https://chatglm.cn/chatglm/user-api/user/refresh", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${refreshToken}`,
-        Referer: "https://chatglm.cn/main/alltoolsdetail",
-        "X-Device-Id": uuid(false),
-        "X-Request-Id": uuid(false),
-        "X-Sign": sign.sign,
-        "X-Timestamp": sign.timestamp,
-        "X-Nonce": sign.nonce,
-        ...getHeaders(),
-        "Content-Type": "application/json",
-      },
-    });
+    const response = await fetch(
+      "https://chatglm.cn/chatglm/user-api/user/refresh",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${refreshToken}`,
+          Referer: "https://chatglm.cn/main/alltoolsdetail",
+          "X-Device-Id": uuid(false),
+          "X-Request-Id": uuid(false),
+          "X-Sign": sign.sign,
+          "X-Timestamp": sign.timestamp,
+          "X-Nonce": sign.nonce,
+          ...getHeaders(),
+          "Content-Type": "application/json",
+        },
+      }
+    );
     const data = await checkResult(response, refreshToken);
     return !!data.result?.access_token;
   } catch {

@@ -3,18 +3,25 @@ import { createParser } from "./sse.ts";
 import {
   createCompletion,
   createCompletionStream,
+  ChatReporters,
 } from "./chat.ts";
 
 const MODEL_NAME = "glm";
 
 // ==================== Claude Adapter ====================
 
-export function convertClaudeToGLM(messages: any[], system?: string | any[]): any[] {
+export function convertClaudeToGLM(
+  messages: any[],
+  system?: string | any[]
+): any[] {
   const glmMessages: any[] = [];
   let systemText: string | undefined;
   if (system) {
     if (Array.isArray(system)) {
-      systemText = system.filter((item: any) => item.type === "text").map((item: any) => item.text).join("\n");
+      systemText = system
+        .filter((item: any) => item.type === "text")
+        .map((item: any) => item.text)
+        .join("\n");
     } else if (typeof system === "string") {
       systemText = system;
     }
@@ -31,7 +38,13 @@ export function convertClaudeToGLM(messages: any[], system?: string | any[]): an
         for (const item of content) {
           if (item.type === "text") texts.push(item.text);
           if (item.type === "tool_result") {
-            texts.push(`工具调用结果 (${item.tool_use_id || ""}):\n${typeof item.content === "string" ? item.content : JSON.stringify(item.content)}`);
+            texts.push(
+              `工具调用结果 (${item.tool_use_id || ""}):\n${
+                typeof item.content === "string"
+                  ? item.content
+                  : JSON.stringify(item.content)
+              }`
+            );
           }
         }
         content = texts.join("\n");
@@ -45,7 +58,11 @@ export function convertClaudeToGLM(messages: any[], system?: string | any[]): an
           if (item.type === "text") texts.push(item.text);
           if (item.type === "tool_use") {
             // 将 Claude 的 tool_use 转换为模型能理解的 JSON 格式
-            texts.push(`{"tool_calls":[{"name":"${item.name}","arguments":${JSON.stringify(item.input || {})}}]}`);
+            texts.push(
+              `{"tool_calls":[{"name":"${
+                item.name
+              }","arguments":${JSON.stringify(item.input || {})}}]}`
+            );
           }
         }
         content = texts.join("\n");
@@ -79,13 +96,18 @@ export function convertGLMToClaude(glmResponse: any): any {
         type: "tool_use",
         id: tc.id,
         name: tc.function.name,
-        input: typeof tc.function.arguments === "string" ? JSON.parse(tc.function.arguments) : tc.function.arguments,
+        input:
+          typeof tc.function.arguments === "string"
+            ? JSON.parse(tc.function.arguments)
+            : tc.function.arguments,
       });
     }
   }
   let stopReason = "end_turn";
-  if (glmResponse.choices[0].finish_reason === "tool_calls") stopReason = "tool_use";
-  else if (glmResponse.choices[0].finish_reason !== "stop") stopReason = "max_tokens";
+  if (glmResponse.choices[0].finish_reason === "tool_calls")
+    stopReason = "tool_use";
+  else if (glmResponse.choices[0].finish_reason !== "stop")
+    stopReason = "max_tokens";
   return {
     id: glmResponse.id || uuid(),
     type: "message",
@@ -101,7 +123,9 @@ export function convertGLMToClaude(glmResponse: any): any {
   };
 }
 
-export function convertGLMStreamToClaude(glmStream: ReadableStream): ReadableStream {
+export function convertGLMStreamToClaude(
+  glmStream: ReadableStream
+): ReadableStream {
   const encoder = new TextEncoder();
   return new ReadableStream({
     async start(controller) {
@@ -120,36 +144,62 @@ export function convertGLMStreamToClaude(glmStream: ReadableStream): ReadableStr
       };
 
       const sendMessageStart = () => {
-        safeEnqueue(encoder.encode(`event: message_start\ndata: ${JSON.stringify({
-          type: "message_start",
-          message: {
-            id: messageId, type: "message", role: "assistant", content: [],
-            model: MODEL_NAME, stop_reason: null, stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 },
-          },
-        })}\n\n`));
+        safeEnqueue(
+          encoder.encode(
+            `event: message_start\ndata: ${JSON.stringify({
+              type: "message_start",
+              message: {
+                id: messageId,
+                type: "message",
+                role: "assistant",
+                content: [],
+                model: MODEL_NAME,
+                stop_reason: null,
+                stop_sequence: null,
+                usage: { input_tokens: 0, output_tokens: 0 },
+              },
+            })}\n\n`
+          )
+        );
       };
 
       const sendTextBlockStart = () => {
         if (textBlockStarted) return;
         textBlockStarted = true;
-        safeEnqueue(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify({
-          type: "content_block_start", index: 0, content_block: { type: "text", text: "" },
-        })}\n\n`));
+        safeEnqueue(
+          encoder.encode(
+            `event: content_block_start\ndata: ${JSON.stringify({
+              type: "content_block_start",
+              index: 0,
+              content_block: { type: "text", text: "" },
+            })}\n\n`
+          )
+        );
       };
 
       const sendTextDelta = (text: string) => {
-        safeEnqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify({
-          type: "content_block_delta", index: 0, delta: { type: "text_delta", text },
-        })}\n\n`));
+        safeEnqueue(
+          encoder.encode(
+            `event: content_block_delta\ndata: ${JSON.stringify({
+              type: "content_block_delta",
+              index: 0,
+              delta: { type: "text_delta", text },
+            })}\n\n`
+          )
+        );
       };
 
       const sendTextBlockStop = () => {
         if (!textBlockStarted) return;
         textBlockStarted = false;
-        safeEnqueue(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({
-          type: "content_block_stop", index: 0,
-        })}\n\n`));
+        safeEnqueue(
+          encoder.encode(
+            `event: content_block_stop\ndata: ${JSON.stringify({
+              type: "content_block_stop",
+              index: 0,
+            })}\n\n`
+          )
+        );
       };
 
       const sendToolBlockStart = (toolCall: any, idx: number) => {
@@ -157,45 +207,66 @@ export function convertGLMStreamToClaude(glmStream: ReadableStream): ReadableStr
         sentToolIds.add(toolCall.id);
         toolBlockIndex = idx;
         toolBlockStarted = true;
-        safeEnqueue(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify({
-          type: "content_block_start",
-          index: idx,
-          content_block: {
-            type: "tool_use",
-            id: toolCall.id,
-            name: toolCall.function?.name || "",
-            input: {},
-          },
-        })}\n\n`));
+        safeEnqueue(
+          encoder.encode(
+            `event: content_block_start\ndata: ${JSON.stringify({
+              type: "content_block_start",
+              index: idx,
+              content_block: {
+                type: "tool_use",
+                id: toolCall.id,
+                name: toolCall.function?.name || "",
+                input: {},
+              },
+            })}\n\n`
+          )
+        );
       };
 
       const sendToolDelta = (partialJson: string, idx: number) => {
-        safeEnqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify({
-          type: "content_block_delta",
-          index: idx,
-          delta: { type: "input_json_delta", partial_json: partialJson },
-        })}\n\n`));
+        safeEnqueue(
+          encoder.encode(
+            `event: content_block_delta\ndata: ${JSON.stringify({
+              type: "content_block_delta",
+              index: idx,
+              delta: { type: "input_json_delta", partial_json: partialJson },
+            })}\n\n`
+          )
+        );
       };
 
       const sendToolBlockStop = (idx: number) => {
         if (!toolBlockStarted) return;
         toolBlockStarted = false;
-        safeEnqueue(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({
-          type: "content_block_stop", index: idx,
-        })}\n\n`));
+        safeEnqueue(
+          encoder.encode(
+            `event: content_block_stop\ndata: ${JSON.stringify({
+              type: "content_block_stop",
+              index: idx,
+            })}\n\n`
+          )
+        );
       };
 
       const sendMessageStop = (stopReason: string) => {
         if (streamClosed) return;
         streamClosed = true;
-        safeEnqueue(encoder.encode(`event: message_delta\ndata: ${JSON.stringify({
-          type: "message_delta",
-          delta: { stop_reason: stopReason, stop_sequence: null },
-          usage: { output_tokens: 1 },
-        })}\n\n`));
-        safeEnqueue(encoder.encode(`event: message_stop\ndata: ${JSON.stringify({
-          type: "message_stop",
-        })}\n\n`));
+        safeEnqueue(
+          encoder.encode(
+            `event: message_delta\ndata: ${JSON.stringify({
+              type: "message_delta",
+              delta: { stop_reason: stopReason, stop_sequence: null },
+              usage: { output_tokens: 1 },
+            })}\n\n`
+          )
+        );
+        safeEnqueue(
+          encoder.encode(
+            `event: message_stop\ndata: ${JSON.stringify({
+              type: "message_stop",
+            })}\n\n`
+          )
+        );
         controller.close();
       };
 
@@ -222,9 +293,10 @@ export function convertGLMStreamToClaude(glmStream: ReadableStream): ReadableStr
               delta.tool_calls.forEach((tc: any, i: number) => {
                 const idx = textBlockStarted ? i + 1 : i;
                 sendToolBlockStart(tc, idx);
-                const args = typeof tc.function?.arguments === "string"
-                  ? tc.function.arguments
-                  : JSON.stringify(tc.function?.arguments || {});
+                const args =
+                  typeof tc.function?.arguments === "string"
+                    ? tc.function.arguments
+                    : JSON.stringify(tc.function?.arguments || {});
                 sendToolDelta(args, idx);
                 sendToolBlockStop(idx);
               });
@@ -274,30 +346,64 @@ export function convertGLMStreamToClaude(glmStream: ReadableStream): ReadableStr
 }
 
 export async function createClaudeCompletion(
-  model: string, messages: any[], system: string | any[] | undefined,
-  refreshToken: string, stream = false, conversationId?: string, tools?: any[]
+  model: string,
+  messages: any[],
+  system: string | any[] | undefined,
+  refreshToken: string,
+  stream = false,
+  conversationId?: string,
+  tools?: any[],
+  tokenPool?: string[],
+  reporters?: ChatReporters
 ): Promise<any | ReadableStream> {
   const glmMessages = convertClaudeToGLM(messages, system);
-  const openaiTools = tools && tools.length > 0 ? convertClaudeToolsToOpenAI(tools) : undefined;
+  const openaiTools =
+    tools && tools.length > 0 ? convertClaudeToolsToOpenAI(tools) : undefined;
   if (stream) {
-    const glmStream = await createCompletionStream(glmMessages, refreshToken, model, conversationId, 0, openaiTools);
+    const glmStream = await createCompletionStream(
+      glmMessages,
+      refreshToken,
+      model,
+      conversationId,
+      0,
+      openaiTools,
+      tokenPool,
+      undefined,
+      reporters
+    );
     return convertGLMStreamToClaude(glmStream);
   } else {
-    const glmResponse = await createCompletion(glmMessages, refreshToken, model, conversationId, 0, openaiTools);
+    const glmResponse = await createCompletion(
+      glmMessages,
+      refreshToken,
+      model,
+      conversationId,
+      0,
+      openaiTools,
+      tokenPool,
+      undefined,
+      reporters
+    );
     return convertGLMToClaude(glmResponse);
   }
 }
 
 // ==================== Gemini Adapter ====================
 
-export function convertGeminiToGLM(contents: any[], systemInstruction?: any): any[] {
+export function convertGeminiToGLM(
+  contents: any[],
+  systemInstruction?: any
+): any[] {
   const glmMessages: any[] = [];
   let systemText = "";
   if (systemInstruction) {
     if (typeof systemInstruction === "string") {
       systemText = systemInstruction;
     } else if (systemInstruction.parts) {
-      systemText = systemInstruction.parts.filter((part: any) => part.text).map((part: any) => part.text).join("\n");
+      systemText = systemInstruction.parts
+        .filter((part: any) => part.text)
+        .map((part: any) => part.text)
+        .join("\n");
     }
   }
   let systemPrepended = false;
@@ -305,7 +411,10 @@ export function convertGeminiToGLM(contents: any[], systemInstruction?: any): an
     const role = content.role === "model" ? "assistant" : "user";
     let text = "";
     if (content.parts && Array.isArray(content.parts)) {
-      text = content.parts.filter((part: any) => part.text).map((part: any) => part.text).join("\n");
+      text = content.parts
+        .filter((part: any) => part.text)
+        .map((part: any) => part.text)
+        .join("\n");
     }
     if (role === "user" && systemText && !systemPrepended) {
       text = `${systemText}\n\n${text}`;
@@ -319,12 +428,17 @@ export function convertGeminiToGLM(contents: any[], systemInstruction?: any): an
 export function convertGLMToGemini(glmResponse: any): any {
   const content = glmResponse.choices[0].message.content;
   return {
-    candidates: [{
-      content: { parts: [{ text: content }], role: "model" },
-      finishReason: glmResponse.choices[0].finish_reason === "stop" ? "STOP" : "MAX_TOKENS",
-      index: 0,
-      safetyRatings: [],
-    }],
+    candidates: [
+      {
+        content: { parts: [{ text: content }], role: "model" },
+        finishReason:
+          glmResponse.choices[0].finish_reason === "stop"
+            ? "STOP"
+            : "MAX_TOKENS",
+        index: 0,
+        safetyRatings: [],
+      },
+    ],
     usageMetadata: {
       promptTokenCount: glmResponse.usage?.prompt_tokens || 0,
       candidatesTokenCount: glmResponse.usage?.completion_tokens || 0,
@@ -333,7 +447,9 @@ export function convertGLMToGemini(glmResponse: any): any {
   };
 }
 
-export function convertGLMStreamToGemini(glmStream: ReadableStream): ReadableStream {
+export function convertGLMStreamToGemini(
+  glmStream: ReadableStream
+): ReadableStream {
   const encoder = new TextEncoder();
   return new ReadableStream({
     async start(controller) {
@@ -346,15 +462,44 @@ export function convertGLMStreamToGemini(glmStream: ReadableStream): ReadableStr
           if (data.choices && data.choices[0]) {
             const delta = data.choices[0].delta;
             if (delta.content) {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                candidates: [{ content: { parts: [{ text: delta.content }], role: "model" }, finishReason: null, index: 0, safetyRatings: [] }],
-              })}\n\n`));
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({
+                    candidates: [
+                      {
+                        content: {
+                          parts: [{ text: delta.content }],
+                          role: "model",
+                        },
+                        finishReason: null,
+                        index: 0,
+                        safetyRatings: [],
+                      },
+                    ],
+                  })}\n\n`
+                )
+              );
             }
             if (data.choices[0].finish_reason) {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                candidates: [{ content: { parts: [{ text: "" }], role: "model" }, finishReason: "STOP", index: 0, safetyRatings: [] }],
-                usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
-              })}\n\n`));
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({
+                    candidates: [
+                      {
+                        content: { parts: [{ text: "" }], role: "model" },
+                        finishReason: "STOP",
+                        index: 0,
+                        safetyRatings: [],
+                      },
+                    ],
+                    usageMetadata: {
+                      promptTokenCount: 1,
+                      candidatesTokenCount: 1,
+                      totalTokenCount: 2,
+                    },
+                  })}\n\n`
+                )
+              );
               controller.close();
             }
           }
@@ -366,7 +511,10 @@ export function convertGLMStreamToGemini(glmStream: ReadableStream): ReadableStr
       try {
         while (true) {
           const { done, value } = await reader.read();
-          if (done) { controller.close(); break; }
+          if (done) {
+            controller.close();
+            break;
+          }
           parser.feed(decoder.decode(value, { stream: true }));
         }
       } catch (err) {
@@ -379,15 +527,41 @@ export function convertGLMStreamToGemini(glmStream: ReadableStream): ReadableStr
 }
 
 export async function createGeminiCompletion(
-  model: string, contents: any[], systemInstruction: any,
-  refreshToken: string, stream = false, conversationId?: string
+  model: string,
+  contents: any[],
+  systemInstruction: any,
+  refreshToken: string,
+  stream = false,
+  conversationId?: string,
+  tokenPool?: string[],
+  reporters?: ChatReporters
 ): Promise<any | ReadableStream> {
   const glmMessages = convertGeminiToGLM(contents, systemInstruction);
   if (stream) {
-    const glmStream = await createCompletionStream(glmMessages, refreshToken, model, conversationId);
+    const glmStream = await createCompletionStream(
+      glmMessages,
+      refreshToken,
+      model,
+      conversationId,
+      0,
+      undefined,
+      tokenPool,
+      undefined,
+      reporters
+    );
     return convertGLMStreamToGemini(glmStream);
   } else {
-    const glmResponse = await createCompletion(glmMessages, refreshToken, model, conversationId);
+    const glmResponse = await createCompletion(
+      glmMessages,
+      refreshToken,
+      model,
+      conversationId,
+      0,
+      undefined,
+      tokenPool,
+      undefined,
+      reporters
+    );
     return convertGLMToGemini(glmResponse);
   }
 }
