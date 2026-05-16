@@ -49,6 +49,47 @@ export interface Env {
   GLM_TOKENS: KVNamespace;
 }
 
+// ==================== Memory Cache (Workers instance scoped) ====================
+// 用于减少 Cloudflare KV 读取次数。同一 Worker 实例的多个请求共享缓存。
+// 注意：Workers 多实例之间内存不共享，仅在单实例内生效；admin 写操作必须 invalidate。
+
+interface CacheEntry<T> {
+  value: T;
+  expiresAt: number;
+}
+
+const memoryCache = new Map<string, CacheEntry<unknown>>();
+
+function cacheGet<T>(key: string): T | undefined {
+  const entry = memoryCache.get(key);
+  if (!entry) return undefined;
+  if (entry.expiresAt < Date.now()) {
+    memoryCache.delete(key);
+    return undefined;
+  }
+  return entry.value as T;
+}
+
+function cacheSet<T>(key: string, value: T, ttlMs: number): void {
+  memoryCache.set(key, { value, expiresAt: Date.now() + ttlMs });
+}
+
+function cacheInvalidate(key: string): void {
+  memoryCache.delete(key);
+}
+
+// TTL 常量
+const CACHE_TTL_POOL_MS = 30 * 1000;
+const CACHE_TTL_HEALTH_MS = 30 * 1000;
+const CACHE_TTL_POLICY_MS = 60 * 1000;
+const CACHE_TTL_AUTOFILL_CFG_MS = 60 * 1000;
+
+// 缓存键
+const CK_TOKEN_POOL = "tp:pool";
+const CK_HEALTH_LIST = "tp:health_list";
+const CK_FAILURE_POLICY = "tp:failure_policy";
+const CK_AUTOFILL_CONFIG = "tp:autofill_config";
+
 interface TokenPoolItem {
   id: string;
   token: string;
@@ -269,6 +310,46 @@ async function setAutoFillStatus(
   await env.GLM_TOKENS.put(AUTO_FILL_STATUS_KEY, JSON.stringify(status));
 }
 
+// ==================== Cached KV Readers ====================
+// 高频读路径使用缓存版本；admin 写操作必须主动 invalidate 对应缓存键。
+
+async function getTokenPoolCached(kv: KVNamespace): Promise<TokenPoolItem[]> {
+  const cached = cacheGet<TokenPoolItem[]>(CK_TOKEN_POOL);
+  if (cached) return cached;
+  const fresh = await getTokenPool(kv);
+  cacheSet(CK_TOKEN_POOL, fresh, CACHE_TTL_POOL_MS);
+  return fresh;
+}
+
+async function listTokenHealthCached(
+  kv: KVNamespace
+): Promise<Array<{ id: string; health: TokenHealth }>> {
+  const cached =
+    cacheGet<Array<{ id: string; health: TokenHealth }>>(CK_HEALTH_LIST);
+  if (cached) return cached;
+  const fresh = await listTokenHealth(kv);
+  cacheSet(CK_HEALTH_LIST, fresh, CACHE_TTL_HEALTH_MS);
+  return fresh;
+}
+
+async function getFailurePolicyCached(
+  kv: KVNamespace
+): Promise<FailurePolicyConfig> {
+  const cached = cacheGet<FailurePolicyConfig>(CK_FAILURE_POLICY);
+  if (cached) return cached;
+  const fresh = await getFailurePolicy(kv);
+  cacheSet(CK_FAILURE_POLICY, fresh, CACHE_TTL_POLICY_MS);
+  return fresh;
+}
+
+async function getAutoFillConfigCached(env: Env): Promise<AutoFillConfig> {
+  const cached = cacheGet<AutoFillConfig>(CK_AUTOFILL_CONFIG);
+  if (cached) return cached;
+  const fresh = await getAutoFillConfig(env);
+  cacheSet(CK_AUTOFILL_CONFIG, fresh, CACHE_TTL_AUTOFILL_CFG_MS);
+  return fresh;
+}
+
 function buildAutoFillResponse(
   config: AutoFillConfig,
   status: AutoFillRunResult | null,
@@ -349,6 +430,8 @@ function buildReporters(env: Env): ChatReporters {
       try {
         // 从池中物理删除被拉黑的 token
         await kv.delete(`rt:${id}`);
+        cacheInvalidate(CK_TOKEN_POOL);
+        cacheInvalidate(CK_HEALTH_LIST);
       } catch (e: any) {
         console.error(
           `[reporter onBlacklist] delete rt:${id} failed: ${e?.message}`
@@ -395,7 +478,22 @@ function buildReporters(env: Env): ChatReporters {
   };
 }
 
-async function authenticate(request: Request, env: Env): Promise<string> {
+/**
+ * 认证 + 选 token 的统一入口。
+ *
+ * 返回 `{ refreshToken, tokenPool }`：
+ *  - refreshToken：本次请求选中的 token（chat 层用作首选）
+ *  - tokenPool：完整可用 token 字符串数组（chat 层 retry 时使用）
+ *
+ * 调用方应直接复用 `tokenPool`，避免再次调用 getTokenPool 引发重复 KV 读。
+ *
+ * 热路径中读取的 pool / health / autofill config 全部走缓存版本（Phase 1 引入），
+ * 缓存命中时不触发 KV 调用；缓存失效后才回源 KV。
+ */
+async function authenticate(
+  request: Request,
+  env: Env
+): Promise<{ refreshToken: string; tokenPool: string[] }> {
   const apiKeys = extractAPIKeys(request);
   if (apiKeys.length === 0) throw new Error("Missing Authorization header");
 
@@ -408,18 +506,19 @@ async function authenticate(request: Request, env: Env): Promise<string> {
   }
   if (!validKey) throw new Error("Invalid API key");
 
-  let pool = await getTokenPool(env.GLM_TOKENS);
+  let pool = await getTokenPoolCached(env.GLM_TOKENS);
 
   // 冷启动自动补池：池子为空时立即补充
   if (pool.length === 0) {
-    const config = await getAutoFillConfig(env);
+    const config = await getAutoFillConfigCached(env);
     if (config.enabled && config.targetCount > 0) {
       const result = await runAutoFill(env, {
         source: "manual",
         respectEnabled: true,
       });
       if (result.success && result.afterCount > 0) {
-        pool = await getTokenPool(env.GLM_TOKENS);
+        // runAutoFill 已 invalidate CK_TOKEN_POOL，这里读到的是新池
+        pool = await getTokenPoolCached(env.GLM_TOKENS);
       }
     }
   }
@@ -429,7 +528,7 @@ async function authenticate(request: Request, env: Env): Promise<string> {
   // 过滤掉 disabled / blacklisted 的 token
   let usablePool: TokenPoolItem[] = pool;
   try {
-    const healthList = await listTokenHealth(env.GLM_TOKENS);
+    const healthList = await listTokenHealthCached(env.GLM_TOKENS);
     const healthMap = new Map<string, TokenHealth>();
     for (const entry of healthList) healthMap.set(entry.id, entry.health);
     const filtered = filterUsableTokens(pool, healthMap);
@@ -445,9 +544,12 @@ async function authenticate(request: Request, env: Env): Promise<string> {
     console.error(`[authenticate] health filter failed: ${e?.message}`);
   }
 
-  const token = selectTokenFromPool(usablePool);
-  if (!token) throw new Error("Failed to select token from pool");
-  return token;
+  const refreshToken = selectTokenFromPool(usablePool);
+  if (!refreshToken) throw new Error("Failed to select token from pool");
+
+  // 返回可用 token 字符串数组（按 usablePool 顺序，便于 chat 层 retry）
+  const tokenPool = usablePool.map((t) => t.token);
+  return { refreshToken, tokenPool };
 }
 
 function authorizeAdmin(request: Request, env: Env): Response | null {
@@ -573,6 +675,9 @@ async function runAutoFill(
       cron: options.cron,
     };
     await setAutoFillStatus(env, result);
+    // pool / health 可能在本次 runAutoFill 中被修改（新增 token / 删除失效 token），统一失效缓存
+    cacheInvalidate(CK_TOKEN_POOL);
+    cacheInvalidate(CK_HEALTH_LIST);
     return result;
   };
 
@@ -709,7 +814,10 @@ async function handleChatCompletions(
   request: Request,
   env: Env
 ): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  const { refreshToken, tokenPool: tokenPoolItems } = await authenticate(
+    request,
+    env
+  );
   const body = (await request.json()) as any;
 
   if (!Array.isArray(body.messages))
@@ -723,8 +831,8 @@ async function handleChatCompletions(
     tools,
     tool_choice,
   } = body;
-  // 读取整个 token 池字符串数组，供 chat 层在 retry 时切换可用 token（排除已失败的 token）
-  const tokenPool = (await getTokenPool(env.GLM_TOKENS)).map((t) => t.token);
+  // 复用 authenticate 已读出的 token 池（避免重复 KV 读）
+  const tokenPool = tokenPoolItems;
   const reporters = buildReporters(env);
   if (stream) {
     const glmStream = await createCompletionStream(
@@ -759,7 +867,10 @@ async function handleClaudeMessages(
   request: Request,
   env: Env
 ): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  const { refreshToken, tokenPool: tokenPoolItems } = await authenticate(
+    request,
+    env
+  );
   const body = (await request.json()) as any;
 
   if (!Array.isArray(body.messages))
@@ -773,8 +884,8 @@ async function handleClaudeMessages(
     conversation_id: convId,
     tools,
   } = body;
-  // 读取整个 token 池字符串数组，供 chat 层在 retry 时切换可用 token（排除已失败的 token）
-  const tokenPool = (await getTokenPool(env.GLM_TOKENS)).map((t) => t.token);
+  // 复用 authenticate 已读出的 token 池（避免重复 KV 读）
+  const tokenPool = tokenPoolItems;
   const reporters = buildReporters(env);
   const result = await createClaudeCompletion(
     model,
@@ -802,14 +913,17 @@ async function handleGeminiGenerateContent(
   path: string,
   env: Env
 ): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  const { refreshToken, tokenPool: tokenPoolItems } = await authenticate(
+    request,
+    env
+  );
   const body = (await request.json()) as any;
 
   const modelMatch = path.match(/^\/v1beta\/models\/(.+):generateContent$/);
   const model = modelMatch ? modelMatch[1] : "gemini-pro";
   const { contents, systemInstruction, conversation_id: convId } = body;
-  // 读取整个 token 池字符串数组，供 chat 层在 retry 时切换可用 token（排除已失败的 token）
-  const tokenPool = (await getTokenPool(env.GLM_TOKENS)).map((t) => t.token);
+  // 复用 authenticate 已读出的 token 池（避免重复 KV 读）
+  const tokenPool = tokenPoolItems;
   const reporters = buildReporters(env);
   const result = await createGeminiCompletion(
     model,
@@ -829,7 +943,10 @@ async function handleGeminiStreamGenerateContent(
   path: string,
   env: Env
 ): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  const { refreshToken, tokenPool: tokenPoolItems } = await authenticate(
+    request,
+    env
+  );
   const body = (await request.json()) as any;
 
   const modelMatch = path.match(
@@ -837,8 +954,8 @@ async function handleGeminiStreamGenerateContent(
   );
   const model = modelMatch ? modelMatch[1] : "gemini-pro";
   const { contents, systemInstruction, conversation_id: convId } = body;
-  // 读取整个 token 池字符串数组，供 chat 层在 retry 时切换可用 token（排除已失败的 token）
-  const tokenPool = (await getTokenPool(env.GLM_TOKENS)).map((t) => t.token);
+  // 复用 authenticate 已读出的 token 池（避免重复 KV 读）
+  const tokenPool = tokenPoolItems;
   const reporters = buildReporters(env);
   const result = await createGeminiCompletion(
     model,
@@ -860,7 +977,7 @@ async function handleImageGenerations(
   request: Request,
   env: Env
 ): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  const { refreshToken } = await authenticate(request, env);
   const body = (await request.json()) as any;
 
   if (!isString(body.prompt)) throw new Error("prompt must be a string");
@@ -897,7 +1014,7 @@ async function handleVideoGenerations(
   request: Request,
   env: Env
 ): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  const { refreshToken } = await authenticate(request, env);
   const body = (await request.json()) as any;
 
   if (!isString(body.prompt)) throw new Error("prompt must be a string");
@@ -945,7 +1062,7 @@ async function handleModels(): Promise<Response> {
 }
 
 async function handleTokenCheck(request: Request, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  const { refreshToken } = await authenticate(request, env);
   const live = await getTokenLiveStatus(refreshToken);
   return jsonResponse({ live });
 }
@@ -1003,6 +1120,8 @@ async function handleAdminToken(request: Request, env: Env): Promise<Response> {
     const id =
       body.id || `tk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     await env.GLM_TOKENS.put(`rt:${id}`, refreshToken);
+    cacheInvalidate(CK_TOKEN_POOL);
+    cacheInvalidate(CK_HEALTH_LIST);
     return jsonResponse({ success: true, message: "Token added to pool", id });
   }
 
@@ -1027,6 +1146,8 @@ async function handleAdminToken(request: Request, env: Env): Promise<Response> {
     } catch (_e) {
       // 健康记录可能不存在，忽略
     }
+    cacheInvalidate(CK_TOKEN_POOL);
+    cacheInvalidate(CK_HEALTH_LIST);
     return jsonResponse({ success: true, message: "Token removed from pool" });
   }
 
@@ -1090,6 +1211,7 @@ async function handleAdminAutoFill(
       targetCount,
     };
     await setAutoFillConfig(env, config);
+    cacheInvalidate(CK_AUTOFILL_CONFIG);
 
     const status = await getAutoFillStatus(env);
     const inspection = await inspectTokenPool(env.GLM_TOKENS);
@@ -1175,6 +1297,7 @@ async function handleAdminTokenHealth(
       return errorResponse("Missing id", 400);
     }
     await deleteTokenHealth(env.GLM_TOKENS, id);
+    cacheInvalidate(CK_HEALTH_LIST);
     return jsonResponse({
       success: true,
       message: `Health record ${id} deleted`,
@@ -1270,6 +1393,7 @@ async function handleAdminTokenHealthUnblock(
   }
 
   await unblockToken(env.GLM_TOKENS, id);
+  cacheInvalidate(CK_HEALTH_LIST);
   return jsonResponse({ success: true, message: `Token ${id} unblocked`, id });
 }
 
@@ -1344,6 +1468,7 @@ async function handleAdminFailurePolicy(
     };
 
     await setFailurePolicy(env.GLM_TOKENS, next);
+    cacheInvalidate(CK_FAILURE_POLICY);
     return jsonResponse({
       success: true,
       message: "Failure policy updated",

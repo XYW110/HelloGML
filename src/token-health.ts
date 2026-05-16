@@ -69,11 +69,14 @@ export const DEFAULT_FAILURE_POLICY: FailurePolicyConfig = {
   blacklistAfterDisables: 5,
   autoRefillOnBlacklist: true,
 };
-
 const EMPTY_HEALTH: TokenHealth = {
   failures: { auth: 0, rate_limit: 0, upstream: 0, unknown: 0 },
   totalDisables: 0,
 };
+
+// 纯成功流量下，仅在距上次成功写入超过该阈值后才再次写 KV，节约写额度。
+// 失败计数清零、disabled 状态解除等"必要写"不受此节流影响。
+const SUCCESS_WRITE_THROTTLE_MS = 5 * 60 * 1000;
 
 // ==================== 失败原因分类 ====================
 
@@ -178,7 +181,8 @@ function mergePolicy(
 ): FailurePolicyConfig {
   const base = DEFAULT_FAILURE_POLICY;
   return {
-    enabled: typeof partial.enabled === "boolean" ? partial.enabled : base.enabled,
+    enabled:
+      typeof partial.enabled === "boolean" ? partial.enabled : base.enabled,
     thresholds: { ...base.thresholds, ...(partial.thresholds || {}) },
     disableMinutes: {
       ...base.disableMinutes,
@@ -393,14 +397,24 @@ export async function reportSuccess(
     health.failures.rate_limit > 0 ||
     health.failures.upstream > 0 ||
     health.failures.unknown > 0;
+  const hasDisable = !health.blacklisted && !!health.disabledUntil;
+  const now = Date.now();
+
+  // 节流路径：无失败、无待解除的临时禁用，且距上次成功不到阈值 → 跳过写入
+  if (!hasFailures && !hasDisable) {
+    const lastSuccess = health.lastSuccessAt ?? 0;
+    if (now - lastSuccess < SUCCESS_WRITE_THROTTLE_MS) {
+      return;
+    }
+  }
+
   health.failures = { auth: 0, rate_limit: 0, upstream: 0, unknown: 0 };
-  health.lastSuccessAt = Date.now();
+  health.lastSuccessAt = now;
   // 自动解除临时禁用（仅当未拉黑）
-  if (!health.blacklisted && health.disabledUntil) {
+  if (hasDisable) {
     health.disabledUntil = undefined;
     health.disabledReason = undefined;
   }
-  // 即使没失败也写一次，刷新 lastSuccessAt，便于面板观察
   await setTokenHealth(ctx.kv, id, health);
   if (hasFailures) {
     console.log(`[token-health] reset failures id=${id}`);
