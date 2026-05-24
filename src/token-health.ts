@@ -210,24 +210,92 @@ function mergePolicy(
 
 // ==================== 健康状态读写 ====================
 
+// 批量健康状态存储配置
+const BATCH_HEALTH_KEY = "health:batch";
+const BATCH_CACHE_TTL_MS = 60 * 1000; // 1分钟内存缓存 TTL
+
+// 批量健康状态缓存（内存）+ 脏标记
+let batchHealthCache: Map<string, TokenHealth> | null = null;
+let batchCacheTime = 0;
+let isBatchDirty = false;
+
+/**
+ * 加载批量健康状态到内存缓存
+ * 如果缓存有效直接返回，否则从 KV 读取
+ */
+async function loadBatchHealthCache(
+  kv: KVNamespace
+): Promise<Map<string, TokenHealth>> {
+  if (batchHealthCache && Date.now() - batchCacheTime < BATCH_CACHE_TTL_MS) {
+    return batchHealthCache;
+  }
+
+  // 缓存过期或未初始化，从 KV 批量键读取
+  const stored = (await kv.get(BATCH_HEALTH_KEY, "json")) as Record<
+    string,
+    TokenHealth
+  > | null;
+
+  batchHealthCache = new Map();
+  if (stored) {
+    for (const [id, health] of Object.entries(stored)) {
+      batchHealthCache.set(id, normalizeHealth(health));
+    }
+  }
+  batchCacheTime = Date.now();
+  isBatchDirty = false;
+
+  return batchHealthCache;
+}
+
+/**
+ * 获取单个 token 的健康状态
+ * 优先从批量缓存读取，缓存未命中则返回默认值
+ */
 export async function getTokenHealth(
   kv: KVNamespace,
   id: string
 ): Promise<TokenHealth> {
-  const stored = (await kv.get(
-    `${HEALTH_KEY_PREFIX}${id}`,
-    "json"
-  )) as TokenHealth | null;
-  if (!stored) return cloneEmpty();
-  return normalizeHealth(stored);
+  const cache = await loadBatchHealthCache(kv);
+  return cache.get(id) ?? cloneEmpty();
 }
 
+/**
+ * 设置单个 token 的健康状态
+ * 仅更新内存缓存并标记为脏，不立即写入 KV
+ * 由调用方（如 TokenReportBuffer）在合适时机调用 flushBatchHealth
+ */
 export async function setTokenHealth(
-  kv: KVNamespace,
+  _kv: KVNamespace,
   id: string,
   health: TokenHealth
 ): Promise<void> {
-  await kv.put(`${HEALTH_KEY_PREFIX}${id}`, JSON.stringify(health));
+  if (!batchHealthCache) {
+    batchHealthCache = new Map();
+  }
+  batchHealthCache.set(id, health);
+  isBatchDirty = true;
+}
+
+/**
+ * 将脏的批量健康状态刷新到 KV
+ * 仅在 isBatchDirty 为 true 时执行写入，避免无效 KV 操作
+ */
+export async function flushBatchHealth(kv: KVNamespace): Promise<void> {
+  if (!isBatchDirty || !batchHealthCache || batchHealthCache.size === 0) return;
+
+  const batchData: Record<string, TokenHealth> = {};
+  for (const [id, health] of batchHealthCache.entries()) {
+    batchData[id] = health;
+  }
+
+  await kv.put(BATCH_HEALTH_KEY, JSON.stringify(batchData));
+
+  isBatchDirty = false;
+  batchCacheTime = Date.now();
+  console.log(
+    `[token-health] flushed ${batchHealthCache.size} health records to KV`
+  );
 }
 
 export async function deleteTokenHealth(
