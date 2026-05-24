@@ -24,6 +24,7 @@ import {
   HEALTH_KEY_PREFIX,
   TokenHealth,
   FailurePolicyConfig,
+  TokenReportBuffer,
 } from "./token-health.ts";
 import {
   defaultTo,
@@ -404,14 +405,27 @@ function selectTokenFromPool(tokens: TokenPoolItem[]): string | null {
 /**
  * 根据 refreshToken 字符串反查 KV 中的 token id（rt:${id} → id）
  * 用于失败上报：把 chat 层只持有的 refreshToken 映射回 health Key 所需 id。
+ *
+ * 优化：使用内存缓存避免重复 KV 读取，缓存有效期跟随 TOKEN_POOL 缓存。
  */
+const CK_TOKEN_ID_MAP = "tp:token_id_map";
+const CACHE_TTL_TOKEN_ID_MAP_MS = 5 * 60 * 1000; // 5分钟
+
 async function resolveTokenIdByRefreshToken(
   kv: KVNamespace,
   refreshToken: string
 ): Promise<string | null> {
-  const pool = await getTokenPool(kv);
-  const item = pool.find((t) => t.token === refreshToken);
-  return item?.id ?? null;
+  // 先尝试从内存缓存获取映射
+  let idMap = cacheGet<Map<string, string>>(CK_TOKEN_ID_MAP);
+
+  if (!idMap) {
+    // 缓存未命中，重新构建映射
+    const pool = await getTokenPool(kv);
+    idMap = new Map(pool.map((item) => [item.token, item.id]));
+    cacheSet(CK_TOKEN_ID_MAP, idMap, CACHE_TTL_TOKEN_ID_MAP_MS);
+  }
+
+  return idMap.get(refreshToken) ?? null;
 }
 
 /**
@@ -420,6 +434,8 @@ async function resolveTokenIdByRefreshToken(
  *  - onFailure: retry 用尽或不可重试错误 → 按 reason 累计；达阈值 disable，达拉黑阈值 blacklist
  *
  * onBlacklist 回调中：删除 rt:${id} + 触发一次 runAutoFill 自动补池（autoRefillOnBlacklist=true 时）。
+ *
+ * 优化：使用 TokenReportBuffer 内存聚合上报，减少 KV 写入次数。
  */
 function buildReporters(env: Env): ChatReporters {
   const kv = env.GLM_TOKENS;
@@ -432,6 +448,7 @@ function buildReporters(env: Env): ChatReporters {
         await kv.delete(`rt:${id}`);
         cacheInvalidate(CK_TOKEN_POOL);
         cacheInvalidate(CK_HEALTH_LIST);
+        cacheInvalidate(CK_TOKEN_ID_MAP); // 同时清除 ID 映射缓存
       } catch (e: any) {
         console.error(
           `[reporter onBlacklist] delete rt:${id} failed: ${e?.message}`
@@ -454,10 +471,14 @@ function buildReporters(env: Env): ChatReporters {
     },
   };
 
+  // 使用内存聚合缓冲区，减少 KV 写入次数
+  const reportBuffer = new TokenReportBuffer(ctx);
+
   return {
     onSuccess: async (token: string) => {
       try {
-        await reportSuccess(ctx, token);
+        // 使用缓冲区聚合成功事件，延迟写入 KV
+        reportBuffer.bufferSuccess(token);
       } catch (e: any) {
         console.error(`[reporter onSuccess] ${e?.message}`);
       }
@@ -470,7 +491,8 @@ function buildReporters(env: Env): ChatReporters {
           contentType: info.contentType,
           error: info.error,
         });
-        await reportFailure(ctx, token, reason);
+        // 使用缓冲区聚合失败事件，auth 类会立即同步
+        reportBuffer.bufferFailure(token, reason);
       } catch (e: any) {
         console.error(`[reporter onFailure] ${e?.message}`);
       }

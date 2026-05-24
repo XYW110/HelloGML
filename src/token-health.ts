@@ -102,6 +102,8 @@ const AUTH_KEYWORDS = [
   "登录过期",
   "请重新登录",
   "认证失败",
+  "多次体验过对话",
+  "请登录后继续使用",
 ];
 
 const RATE_LIMIT_KEYWORDS = [
@@ -473,4 +475,280 @@ export function maskTokenForDisplay(token: string): string {
   if (!token) return "<empty>";
   if (token.length <= 12) return `${token.slice(0, 2)}***`;
   return `${token.slice(0, 6)}***${token.slice(-4)}`;
+}
+
+// ==================== 内存聚合上报缓冲区 ====================
+
+/**
+ * Token 上报缓冲区事件类型
+ */
+interface BufferedTokenEvent {
+  type: "success" | "failure";
+  reason?: FailureReason;
+  timestamp: number;
+}
+
+/**
+ * Token 健康状态聚合缓冲区
+ *
+ * 设计目标：
+ * - 在内存中累积成功/失败事件，避免每次事件都触发 KV 写入
+ * - 定期批量同步到 KV，或在状态发生关键变化时立即同步
+ * - 对于 auth 类失败，立即触发同步以快速拉黑
+ * - 对于其他类型失败，达到阈值时触发同步
+ */
+export class TokenReportBuffer {
+  private eventBuffer: Map<string, BufferedTokenEvent[]> = new Map();
+  private lastSyncTime: Map<string, number> = new Map();
+  private pendingSync: Map<string, ReturnType<typeof setTimeout>> = new Map();
+
+  // 配置参数
+  private readonly SYNC_DELAY_MS = 5000; // 5秒延迟同步
+  private readonly MAX_BUFFER_SIZE = 20; // 每个 token 最大缓存事件数
+  private readonly SYNC_COOLDOWN_MS = 10000; // 同步冷却时间
+
+  constructor(private ctx: ReportContext) {}
+
+  /**
+   * 缓冲一次成功事件
+   */
+  bufferSuccess(token: string): void {
+    this.addEvent(token, { type: "success", timestamp: Date.now() });
+    this.scheduleSync(token, false); // 成功事件延迟同步
+  }
+
+  /**
+   * 缓冲一次失败事件
+   * 对于 auth 类失败，立即触发同步
+   */
+  bufferFailure(token: string, reason: FailureReason): void {
+    this.addEvent(token, { type: "failure", reason, timestamp: Date.now() });
+
+    // auth 类失败立即同步，以便快速拉黑
+    if (reason === "auth") {
+      this.scheduleSync(token, true);
+    } else {
+      this.scheduleSync(token, false);
+    }
+  }
+
+  /**
+   * 添加事件到缓冲区
+   */
+  private addEvent(token: string, event: BufferedTokenEvent): void {
+    let events = this.eventBuffer.get(token);
+    if (!events) {
+      events = [];
+      this.eventBuffer.set(token, events);
+    }
+
+    events.push(event);
+
+    // 限制缓冲区大小
+    if (events.length > this.MAX_BUFFER_SIZE) {
+      events.shift(); // 移除最旧的事件
+    }
+  }
+
+  /**
+   * 调度同步操作
+   * @param immediate 是否立即同步
+   */
+  private scheduleSync(token: string, immediate: boolean): void {
+    // 清除之前的调度
+    const existingTimer = this.pendingSync.get(token);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      this.pendingSync.delete(token);
+    }
+
+    if (immediate) {
+      // 立即同步
+      this.flushToken(token).catch((err) => {
+        console.error(
+          `[TokenReportBuffer] immediate sync failed for token: ${err.message}`
+        );
+      });
+    } else {
+      // 延迟同步
+      const timer = setTimeout(() => {
+        this.flushToken(token).catch((err) => {
+          console.error(
+            `[TokenReportBuffer] delayed sync failed for token: ${err.message}`
+          );
+        });
+      }, this.SYNC_DELAY_MS);
+
+      this.pendingSync.set(token, timer);
+    }
+  }
+
+  /**
+   * 刷新指定 token 的所有缓冲事件到 KV
+   */
+  private async flushToken(token: string): Promise<void> {
+    const events = this.eventBuffer.get(token);
+    if (!events || events.length === 0) return;
+
+    // 检查冷却时间
+    const lastSync = this.lastSyncTime.get(token) || 0;
+    const now = Date.now();
+    if (
+      now - lastSync < this.SYNC_COOLDOWN_MS &&
+      events.length < this.MAX_BUFFER_SIZE
+    ) {
+      return; // 冷却期内且未满，跳过
+    }
+
+    try {
+      const id = await this.ctx.resolveTokenId(token);
+      if (!id) {
+        // 无法解析 ID，清空缓冲区
+        this.eventBuffer.delete(token);
+        return;
+      }
+
+      const health = await getTokenHealth(this.ctx.kv, id);
+
+      // 聚合事件
+      let hasFailure = false;
+      let hasAuthFailure = false;
+
+      for (const event of events) {
+        if (event.type === "success") {
+          // 成功事件重置所有失败计数
+          health.failures = { auth: 0, rate_limit: 0, upstream: 0, unknown: 0 };
+          health.lastSuccessAt = event.timestamp;
+        } else if (event.type === "failure" && event.reason) {
+          hasFailure = true;
+          if (event.reason === "auth") hasAuthFailure = true;
+
+          health.failures[event.reason] =
+            (health.failures[event.reason] || 0) + 1;
+          health.lastFailureAt = event.timestamp;
+        }
+      }
+
+      // 清空缓冲区
+      this.eventBuffer.delete(token);
+      this.lastSyncTime.set(token, now);
+
+      // 检查是否需要触发拉黑逻辑
+      const policy = await getFailurePolicy(this.ctx.kv);
+      if (policy.enabled) {
+        const shouldBlacklist = await this.checkAndApplyBlacklist(
+          health,
+          policy,
+          id
+        );
+        if (shouldBlacklist) {
+          // 已拉黑，调用回调
+          if (this.ctx.onBlacklist) {
+            try {
+              await this.ctx.onBlacklist(
+                id,
+                health.disabledReason || "buffered failure"
+              );
+            } catch (e: any) {
+              console.error(
+                `[TokenReportBuffer] onBlacklist error: ${e.message}`
+              );
+            }
+          }
+        }
+      }
+
+      // 保存到 KV
+      await setTokenHealth(this.ctx.kv, id, health);
+
+      if (hasFailure) {
+        console.log(
+          `[TokenReportBuffer] flushed ${events.length} events for token id=${id}, authFailure=${hasAuthFailure}`
+        );
+      }
+    } catch (err: any) {
+      console.error(`[TokenReportBuffer] flush failed: ${err.message}`);
+      // 失败时保留缓冲区，下次重试
+    }
+  }
+
+  /**
+   * 检查并应用拉黑逻辑
+   * @returns 是否触发了拉黑
+   */
+  private async checkAndApplyBlacklist(
+    health: TokenHealth,
+    policy: FailurePolicyConfig,
+    id: string
+  ): Promise<boolean> {
+    const now = Date.now();
+
+    // 检查各类型的失败阈值
+    for (const reason of [
+      "auth",
+      "rate_limit",
+      "upstream",
+      "unknown",
+    ] as FailureReason[]) {
+      const threshold = policy.thresholds[reason];
+      if (threshold > 0 && health.failures[reason] >= threshold) {
+        const minutes = policy.disableMinutes[reason];
+
+        if (minutes <= 0) {
+          // 直接拉黑
+          health.blacklisted = true;
+          health.disabledReason = `${reason} 累计 ${health.failures[reason]} 次 → 永久拉黑`;
+          health.totalDisables = (health.totalDisables || 0) + 1;
+          console.warn(
+            `[TokenReportBuffer] blacklist token id=${id} reason=${reason}`
+          );
+          return true;
+        }
+
+        // 临时禁用
+        health.disabledUntil = now + minutes * 60 * 1000;
+        health.disabledReason = `${reason} 累计 ${health.failures[reason]} 次 → 禁用 ${minutes} 分钟`;
+        health.totalDisables = (health.totalDisables || 0) + 1;
+        health.failures[reason] = 0; // 重置该类计数器
+
+        // 累计禁用过多 → 升级为拉黑
+        if (
+          policy.blacklistAfterDisables > 0 &&
+          health.totalDisables >= policy.blacklistAfterDisables
+        ) {
+          health.blacklisted = true;
+          health.disabledReason = `累计被禁用 ${health.totalDisables} 次 → 永久拉黑`;
+          console.warn(
+            `[TokenReportBuffer] blacklist token id=${id} reason=overuse`
+          );
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * 强制刷新所有缓冲事件（用于 Worker 关闭前）
+   */
+  async flushAll(): Promise<void> {
+    const tokens = Array.from(this.eventBuffer.keys());
+    const promises = tokens.map((token) => this.flushToken(token));
+    await Promise.allSettled(promises);
+  }
+
+  /**
+   * 获取缓冲区状态（用于监控/调试）
+   */
+  getStats(): { bufferedTokens: number; totalEvents: number } {
+    let totalEvents = 0;
+    for (const events of this.eventBuffer.values()) {
+      totalEvents += events.length;
+    }
+    return {
+      bufferedTokens: this.eventBuffer.size,
+      totalEvents,
+    };
+  }
 }
