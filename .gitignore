@@ -1,1 +1,4 @@
 /node_modules
+.snow/
+/.snow
+/.spec-workflow
