@@ -22,6 +22,12 @@ import {
   fetchFileBASE64,
 } from "./utils.ts";
 import { createParser } from "./sse.ts";
+import {
+  ToolStreamSieve,
+  parseDSMLFormat,
+  type ParsedToolCall,
+} from "./dsml-parse";
+import { evaluateRetryDirective, type RetryDirective } from "./tool-retry";
 
 const MODEL_NAME = "glm";
 const DEFAULT_ASSISTANT_ID = "65940acff94777010aa6b796";
@@ -133,8 +139,16 @@ function getHeaders() {
 
 // ==================== Tool Calling Helpers ====================
 
-function injectToolsPrompt(messages: any[], tools: any[]): any[] {
-  if (!tools || tools.length === 0) return messages;
+/**
+ * 构建 DSML 格式的工具调用指令块
+ * 包含格式说明、规则示例和 tool_choice 约束
+ */
+function buildToolInstructionBlock(
+  tools: any[],
+  toolChoiceMode: "auto" | "required" | "none" = "auto",
+  requiredToolName?: string
+): string {
+  // 构建工具列表描述
   const toolsDesc = tools
     .map((tool: any) => {
       const fn = tool.function || tool;
@@ -143,25 +157,87 @@ Description: ${fn.description || ""}
 Parameters: ${JSON.stringify(fn.parameters || {}, null, 2)}`;
     })
     .join("\n\n");
-  const prompt = `You are an assistant with access to tools. When you need to use a tool, you MUST output ONLY a single JSON object with NO markdown, NO explanations, and NO extra text.
 
-STRICT RULES:
-1. If a tool is needed, output EXACTLY this format (nothing else):
-{"tool_calls":[{"name":"TOOL_NAME","arguments":{"param":"value"}}]}
+  // 构建 tool_choice 约束指令
+  let toolChoiceConstraint = "";
+  if (toolChoiceMode === "required" && requiredToolName) {
+    toolChoiceConstraint = `
+【强制】本轮必须调用工具 "${requiredToolName}"，不能仅回复普通文本
+MANDATORY: this turn MUST call the exact tool "${requiredToolName}"`;
+  } else if (toolChoiceMode === "none") {
+    toolChoiceConstraint = `
+【禁止】本轮不得调用任何工具，仅回复普通文本
+FORBIDDEN: this turn MUST NOT call any tool`;
+  }
 
-2. Do NOT wrap the JSON in markdown code blocks (no \`\`\`json).
-3. Do NOT add any explanation before or after the JSON.
-4. If no tool is needed, respond normally with plain text.
+  // 构建 DSML 格式指令
+  const prompt = `=== MANDATORY TOOL CALL INSTRUCTIONS ===
+These are gateway bridge tools; do not invoke the platform's built-in tool system.
+
+TOOL CALL FORMAT — FOLLOW EXACTLY:
+<|DSML|tool_calls>
+  <|DSML|invoke name="TOOL_NAME_HERE">
+    <|DSML|parameter name="PARAM_NAME"><![CDATA[VALUE]]></|DSML|parameter>
+  </|DSML|invoke>
+</|DSML|tool_calls>
+
+Rules:
+- Use one <|DSML|tool_calls> root when calling tools.
+- Use <![CDATA[...]]> for string values.
+- Do NOT wrap XML in markdown fences.
+- Compatibility note: legacy output formats may be parsed, but the model-facing format is DSML/XML only.
+${toolChoiceConstraint}
 
 Available tools:
 ${toolsDesc}
 
 Examples:
 User: What is the weather in Beijing?
-Assistant: {"tool_calls":[{"name":"get_weather","arguments":{"location":"Beijing"}}]}
+Assistant:
+<|DSML|tool_calls>
+  <|DSML|invoke name="get_weather">
+    <|DSML|parameter name="location"><![CDATA[Beijing]]></|DSML|parameter>
+  </|DSML|invoke>
+</|DSML|tool_calls>
 
 User: Hello
 Assistant: Hello! How can I help you today?`;
+
+  return prompt;
+}
+
+/**
+ * 向消息中注入工具调用提示
+ * 支持 tool_choice 模式：auto（默认）、required、none
+ */
+function injectToolsPrompt(
+  messages: any[],
+  tools: any[],
+  toolChoice?: { type: string; function?: { name: string } }
+): any[] {
+  if (!tools || tools.length === 0) return messages;
+
+  // 解析 tool_choice 模式
+  let toolChoiceMode: "auto" | "required" | "none" = "auto";
+  let requiredToolName: string | undefined;
+
+  if (toolChoice) {
+    if (toolChoice.type === "function" && toolChoice.function?.name) {
+      toolChoiceMode = "required";
+      requiredToolName = toolChoice.function.name;
+    } else if (toolChoice.type === "none") {
+      toolChoiceMode = "none";
+    }
+  }
+
+  // 构建 DSML 格式指令
+  const prompt = buildToolInstructionBlock(
+    tools,
+    toolChoiceMode,
+    requiredToolName
+  );
+
+  // 将指令插入到 system 消息中
   const newMessages = [...messages];
   const systemIdx = newMessages.findIndex((m: any) => m.role === "system");
   if (systemIdx >= 0) {
@@ -576,6 +652,51 @@ export async function createCompletion(
     removeConversation(answer.id, refreshToken, assistantId).catch(() => {});
     // 上报成功：当前 refreshToken 工作正常
     await safeReport(() => reporters?.onSuccess?.(refreshToken));
+
+    // DSML 格式纠正重试（仅非流式 + 有工具时启用）
+    if (tools && tools.length > 0) {
+      const allowedNames = new Set(
+        tools.map((t: any) => t.function?.name || t.name || String(t))
+      );
+      const fullContent = answer.choices?.[0]?.message?.content || "";
+      if (fullContent) {
+        const directive = evaluateRetryDirective(
+          fullContent,
+          allowedNames,
+          retryCount,
+          2
+        );
+        if (directive.shouldRetry && retryCount < 2) {
+          console.warn(
+            `[DSML format retry] ${directive.errorType}, attempt=${
+              retryCount + 1
+            }`
+          );
+          await sleep(500);
+          const retryPrompt =
+            directive.correctionPrompt || "请重新输出符合格式的工具调用。";
+          const originalQuery = messages[messages.length - 1]?.content || "";
+          const messagesWithRetry = [
+            ...messages,
+            { role: "assistant", content: fullContent },
+            { role: "system", content: retryPrompt },
+            { role: "user", content: originalQuery },
+          ];
+          return createCompletion(
+            messagesWithRetry,
+            refreshToken,
+            model,
+            "",
+            retryCount + 1,
+            tools,
+            tokenPool,
+            triedTokens,
+            reporters
+          );
+        }
+      }
+    }
+
     return answer;
   })().catch(async (err) => {
     // 上报失败（携带状态码 / body / contentType / error 对象）
@@ -1364,9 +1485,12 @@ function createTransStream(
   let sentContent = "";
   let sentReasoning = "";
   let fullContent = "";
-  let isToolCallMode = false;
-  let mightBeToolCall = false;
-  let pendingContent = "";
+  // DSML tool call sieve for streaming detection
+  const allowedNames =
+    tools && tools.length > 0
+      ? new Set(tools.map((t: any) => t.function?.name || t.name || String(t)))
+      : new Set<string>();
+  const sieve = new ToolStreamSieve(allowedNames);
   const cachedParts: any[] = [];
   return new ReadableStream({
     async start(controller) {
@@ -1540,71 +1664,70 @@ function createTransStream(
             if (chunk) {
               sentContent += chunk;
               fullContent += chunk;
-              // 智能缓冲：检测是否可能是纯工具调用 JSON，避免先发送部分 JSON 文本
-              if (!isToolCallMode && tools && tools.length > 0) {
-                const trimmed = fullContent.trim();
-                if (!mightBeToolCall) {
-                  // 如果内容以 { 开头，可能是工具调用，进入缓冲模式
-                  if (trimmed.startsWith("{")) {
-                    mightBeToolCall = true;
-                    pendingContent += chunk;
-                  } else {
-                    // 不以 { 开头，直接发送
-                    controller.enqueue(
-                      encoder.encode(
-                        `data: ${JSON.stringify({
-                          id: result.conversation_id,
-                          model: MODEL_NAME,
-                          object: "chat.completion.chunk",
-                          choices: [
-                            {
-                              index: 0,
-                              delta: { content: chunk },
-                              finish_reason: null,
-                            },
-                          ],
-                          created,
-                        })}\n\n`
-                      )
-                    );
-                  }
-                } else {
-                  // 已在缓冲模式，继续累积
-                  pendingContent += chunk;
-                  // 当累积足够内容后，判断是否是工具调用
-                  if (trimmed.length >= 20) {
-                    if (
-                      trimmed.includes('"tool_calls"') ||
-                      trimmed.includes("'tool_calls'") ||
-                      trimmed.includes("tool_calls")
-                    ) {
-                      isToolCallMode = true;
-                      pendingContent = "";
-                    } else {
-                      // 不是工具调用，一次性发送缓冲内容
-                      mightBeToolCall = false;
-                      controller.enqueue(
-                        encoder.encode(
-                          `data: ${JSON.stringify({
-                            id: result.conversation_id,
-                            model: MODEL_NAME,
-                            object: "chat.completion.chunk",
-                            choices: [
-                              {
-                                index: 0,
-                                delta: { content: pendingContent },
-                                finish_reason: null,
-                              },
-                            ],
-                            created,
-                          })}\n\n`
-                        )
-                      );
-                      pendingContent = "";
-                    }
-                  }
+
+              // 使用 ToolStreamSieve 分离普通文本和工具调用
+              if (tools && tools.length > 0) {
+                const sieveResult = sieve.feed(chunk);
+                // 调试日志：追踪 sieve 状态
+                if (!sieveResult.text && !sieveResult.toolCalls) {
+                  console.warn(
+                    `[DSML Sieve] Buffered ${chunk.length} chars, no output yet`
+                  );
                 }
-              } else if (!isToolCallMode) {
+
+                // 先发送普通文本（如果非空）
+                if (sieveResult.text) {
+                  controller.enqueue(
+                    encoder.encode(
+                      `data: ${JSON.stringify({
+                        id: result.conversation_id,
+                        model: MODEL_NAME,
+                        object: "chat.completion.chunk",
+                        choices: [
+                          {
+                            index: 0,
+                            delta: { content: sieveResult.text },
+                            finish_reason: null,
+                          },
+                        ],
+                        created,
+                      })}\n\n`
+                    )
+                  );
+                }
+
+                // 如果有工具调用，发送工具调用块
+                if (sieveResult.toolCalls && sieveResult.toolCalls.length > 0) {
+                  const toolCalls = sieveResult.toolCalls.map((call, idx) => ({
+                    id: `call_${Math.random()
+                      .toString(36)
+                      .slice(2, 11)}_${idx}`,
+                    type: "function",
+                    function: {
+                      name: call.name,
+                      arguments: JSON.stringify(call.input),
+                    },
+                  }));
+                  controller.enqueue(
+                    encoder.encode(
+                      `data: ${JSON.stringify({
+                        id: result.conversation_id,
+                        model: MODEL_NAME,
+                        object: "chat.completion.chunk",
+                        choices: [
+                          {
+                            index: 0,
+                            delta: { tool_calls: toolCalls },
+                            finish_reason: null,
+                          },
+                        ],
+                        created,
+                      })}\n\n`
+                    )
+                  );
+                }
+              } else {
+                // 无工具调用场景，直接发送文本
                 controller.enqueue(
                   encoder.encode(
                     `data: ${JSON.stringify({
@@ -1625,16 +1748,64 @@ function createTransStream(
               }
             }
           } else {
+            // 流结束：刷新 sieve 缓冲区，释放未闭合标签或剩余文本
+            if (tools && tools.length > 0) {
+              const flushed = sieve.flush();
+              if (flushed.text) {
+                controller.enqueue(
+                  encoder.encode(
+                    `data: ${JSON.stringify({
+                      id: result.conversation_id,
+                      model: MODEL_NAME,
+                      object: "chat.completion.chunk",
+                      choices: [
+                        {
+                          index: 0,
+                          delta: { content: flushed.text },
+                          finish_reason: null,
+                        },
+                      ],
+                      created,
+                    })}\n\n`
+                  )
+                );
+              }
+              // flush 出的工具调用追加到 fullContent 以便最终解析
+              if (flushed.toolCalls && flushed.toolCalls.length > 0) {
+                fullContent += flushed.toolCalls
+                  .map(
+                    (c) =>
+                      `<invoke name="${c.name}">${JSON.stringify(
+                        c.input
+                      )}</invoke>`
+                  )
+                  .join("");
+              }
+            }
+
             let finishReason = "stop";
             let delta: any =
               result.status == "intervene" && result.last_error?.intervene_text
                 ? { content: `\n\n${result.last_error.intervene_text}` }
                 : {};
             if (tools && tools.length > 0) {
-              const parsed = parseToolCalls(fullContent);
-              if (parsed.tool_calls) {
+              const calls = parseDSMLFormat(fullContent, allowedNames);
+              if (calls.length > 0) {
                 finishReason = "tool_calls";
-                delta = { tool_calls: parsed.tool_calls };
+                delta = {
+                  tool_calls: calls.map(
+                    (call: ParsedToolCall, idx: number) => ({
+                      id: `call_${Math.random()
+                        .toString(36)
+                        .slice(2, 11)}_${idx}`,
+                      type: "function",
+                      function: {
+                        name: call.name,
+                        arguments: JSON.stringify(call.input),
+                      },
+                    })
+                  ),
+                };
               }
             }
             controller.enqueue(

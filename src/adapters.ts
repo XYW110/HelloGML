@@ -57,11 +57,21 @@ export function convertClaudeToGLM(
         for (const item of content) {
           if (item.type === "text") texts.push(item.text);
           if (item.type === "tool_use") {
-            // 将 Claude 的 tool_use 转换为模型能理解的 JSON 格式
+            // 将 Claude 的 tool_use 转换为 DSML 格式呈现给模型
+            const params = Object.entries(item.input || {})
+              .map(
+                ([k, v]) =>
+                  `    <|DSML|parameter name="${k}"><![CDATA[${
+                    typeof v === "string" ? v : JSON.stringify(v)
+                  }]]\></|DSML|parameter>`
+              )
+              .join("\n");
             texts.push(
-              `{"tool_calls":[{"name":"${
-                item.name
-              }","arguments":${JSON.stringify(item.input || {})}}]}`
+              `<|DSML|tool_calls>
+<|DSML|invoke name="${item.name}">
+${params}
+</|DSML|invoke>
+</|DSML|tool_calls>`
             );
           }
         }
