@@ -26,23 +26,23 @@ export function createParser(onEvent: (event: SSEEvent) => void) {
   return {
     feed(chunk: string) {
       buffer += chunk;
-      const lines = buffer.split("\n");
+      // 同时支持 LF (\n) 和 CRLF (\r\n) 作为行分隔符
+      const lines = buffer.split(/\r?\n/);
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        const trimmed = line.endsWith("\r") ? line.slice(0, -1) : line;
-
-        if (trimmed === "") {
+        // 过滤空行，避免多余换行触发空事件
+        if (line === "") {
           dispatch();
-        } else if (trimmed.startsWith("data: ")) {
-          eventData += (eventData ? "\n" : "") + trimmed.slice(6);
-        } else if (trimmed.startsWith("event: ")) {
-          eventType = trimmed.slice(7);
-        } else if (trimmed.startsWith("id: ")) {
+        } else if (line.startsWith("data: ")) {
+          eventData += (eventData ? "\n" : "") + line.slice(6);
+        } else if (line.startsWith("event: ")) {
+          eventType = line.slice(7);
+        } else if (line.startsWith("id: ")) {
           // ignore id
-        } else if (trimmed.startsWith("retry: ")) {
+        } else if (line.startsWith("retry: ")) {
           // ignore retry
-        } else if (trimmed.startsWith(":")) {
+        } else if (line.startsWith(":")) {
           // comment, ignore
         }
       }

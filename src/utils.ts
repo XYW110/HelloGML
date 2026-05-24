@@ -2,17 +2,15 @@
  * 通用工具函数（替代原项目的 util.ts + lodash 常用功能）
  */
 
+import { md5 as md5Lib } from 'js-md5';
+
 export function uuid(separator = true): string {
   const id = crypto.randomUUID();
   return separator ? id : id.replace(/-/g, "");
 }
 
 export async function md5(text: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(text);
-  const hashBuffer = await crypto.subtle.digest("MD5", data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  return md5Lib(text);
 }
 
 export function unixTimestamp(): number {
@@ -26,8 +24,9 @@ export function timestamp(): number {
 export function encodeBASE64(str: string): string {
   const bytes = new TextEncoder().encode(str);
   let binary = "";
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize) as any);
   }
   return btoa(binary);
 }
@@ -46,8 +45,9 @@ export async function fetchFileBASE64(url: string): Promise<string> {
   const arrayBuffer = await response.arrayBuffer();
   const bytes = new Uint8Array(arrayBuffer);
   let binary = "";
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize) as any);
   }
   return btoa(binary);
 }
@@ -68,8 +68,9 @@ export function removeBASE64DataHeader(value: string): string {
 export function buildDataBASE64(type: string, ext: string, buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
   let binary = "";
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize) as any);
   }
   return `data:${type}/${ext.replace("jpg", "jpeg")};base64,${btoa(binary)}`;
 }

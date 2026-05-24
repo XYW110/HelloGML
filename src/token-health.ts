@@ -78,6 +78,13 @@ const EMPTY_HEALTH: TokenHealth = {
 // 失败计数清零、disabled 状态解除等"必要写"不受此节流影响。
 const SUCCESS_WRITE_THROTTLE_MS = 5 * 60 * 1000;
 
+// 失败上报时，若未达阈值且距上次失败写入未超过此间隔，则跳过写入以减少 KV 写操作。
+// 达到阈值触发的禁用/拉黑属于"必要写"，不受此节流限制。
+const FAILURE_WRITE_THROTTLE_MS = 30 * 1000;
+
+// listTokenHealth 并发读取信号量上限，避免触发 Workers 并发限制
+const LIST_CONCURRENCY = 10;
+
 // ==================== 失败原因分类 ====================
 
 const AUTH_KEYWORDS = [
@@ -233,13 +240,24 @@ export async function listTokenHealth(
 ): Promise<Array<{ id: string; health: TokenHealth }>> {
   const results: Array<{ id: string; health: TokenHealth }> = [];
   let cursor: string | undefined;
+
   while (true) {
     const page = await kv.list({ prefix: HEALTH_KEY_PREFIX, cursor });
-    for (const key of page.keys) {
-      const id = key.name.replace(HEALTH_KEY_PREFIX, "");
-      const raw = (await kv.get(key.name, "json")) as TokenHealth | null;
-      results.push({ id, health: raw ? normalizeHealth(raw) : cloneEmpty() });
+    const keys = page.keys;
+
+    // 分批并发读取，每批最多 LIST_CONCURRENCY 个
+    for (let i = 0; i < keys.length; i += LIST_CONCURRENCY) {
+      const batch = keys.slice(i, i + LIST_CONCURRENCY);
+      const batchResults = await Promise.all(
+        batch.map(async (key) => {
+          const id = key.name.replace(HEALTH_KEY_PREFIX, "");
+          const raw = (await kv.get(key.name, "json")) as TokenHealth | null;
+          return { id, health: raw ? normalizeHealth(raw) : cloneEmpty() };
+        })
+      );
+      results.push(...batchResults);
     }
+
     if (page.list_complete) break;
     cursor = page.cursor;
   }
@@ -377,6 +395,17 @@ export async function reportFailure(
       }
       return;
     }
+
+    // 命中阈值触发的禁用属于必要写，直接写入
+    await setTokenHealth(ctx.kv, id, health);
+    return;
+  }
+
+  // 未达阈值：应用失败写入节流，减少高频小故障场景下的无效写操作
+  const now = Date.now();
+  const lastFailure = health.lastFailureAt ?? 0;
+  if (now - lastFailure < FAILURE_WRITE_THROTTLE_MS) {
+    return;
   }
 
   await setTokenHealth(ctx.kv, id, health);
